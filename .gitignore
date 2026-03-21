@@ -1,0 +1,9 @@
+# Build products
+build/
+
+# Editor temporaries
+*~
+*.swp
+
+# Dependency files (also in build/, but just in case)
+*.d
