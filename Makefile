@@ -33,9 +33,22 @@ HIP_FLAGS := -std=c++17 -O3 $(INCLUDES)  \
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
-.PHONY: all clean info
+.PHONY: all lib clean info
 
 all: $(BUILDDIR)/density_hip $(BUILDDIR)/density_hip_unrolled
+
+# ---------------------------------------------------------------------------
+# Static library target — used when linking against Phantom (GPU=yes).
+# Contains the density solver core + the Fortran-callable C API wrapper.
+# Phantom links with: -L<cosmoSPHere>/build -lcosmoSPHere
+# ---------------------------------------------------------------------------
+lib: $(BUILDDIR)/libcosmoSPHere.a
+
+$(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/dens_c_api.o
+	ar rcs $@ $^
+
+$(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu
+	$(HIPCC) $(HIP_FLAGS) -MMD -MP -MF $(BUILDDIR)/dens_c_api.d -c -o $@ $<
 
 # Scalar (base) binary
 $(BUILDDIR)/density_hip: $(BUILDDIR)/main.base.o $(BUILDDIR)/density_base.o
@@ -64,7 +77,8 @@ $(BUILDDIR)/main.unrolled.o: src/main.cu
 
 clean:
 	rm -f $(BUILDDIR)/*.o $(BUILDDIR)/*.d \
-	      $(BUILDDIR)/density_hip $(BUILDDIR)/density_hip_unrolled
+	      $(BUILDDIR)/density_hip $(BUILDDIR)/density_hip_unrolled \
+	      $(BUILDDIR)/libcosmoSPHere.a
 
 info:
 	@$(HIPCC) --version
