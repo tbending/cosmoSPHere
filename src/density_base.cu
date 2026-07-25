@@ -227,13 +227,23 @@ __global__ void sphDensityKernel(const double* __restrict__ x,
     const double rho_i  = rhoi  * sph::cnormk * pmass * hi31;
     const double grad_i = gradhi * sph::cnormk * pmass * hi41;
 
+    // Guard: if rho_i == 0 (no neighbours), skip update to avoid divide-by-zero.
+    if (rho_i == 0.0) { converged[i] = 0; return; }
+
     const double funci   = pmass * (sph::hfact * hi1) * (sph::hfact * hi1) * (sph::hfact * hi1) - rho_i;
     const double dhdrhoi = -hi / (3.0 * rho_i);
     // omega must use the NORMALISED grad_i (= d(rho)/d(h)), matching Fortran:
     //   gradhi = gradh(i) * cnormk * pmass * hi41
     //   omegai = 1 - dhdrhoi * gradhi
     const double omegai  = 1.0 - dhdrhoi * grad_i;
-    const double hi_new  = hi - funci * dhdrhoi / omegai;
+    const double hi_new_raw = hi - funci * dhdrhoi / omegai;
+
+    // Clamp step to ±20% per iteration (mirrors Fortran finish_cell in dens.F90)
+    // to prevent overshoot at steep density gradients (e.g. shock fronts).
+    double hi_new;
+    if      (hi_new_raw > 1.2 * hi) hi_new = 1.2 * hi;
+    else if (hi_new_raw < 0.8 * hi) hi_new = 0.8 * hi;
+    else                             hi_new = hi_new_raw;
 
     rho[i]       = rho_i;
     gradh[i]     = grad_i;
@@ -474,7 +484,14 @@ __global__ void sphDensityKernelJList(
     const double dhdrhoi = -hi / (3.0 * rho_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
     const double omegai  = 1.0 - dhdrhoi * grad_i;
-    const double hi_new  = hi - funci * dhdrhoi / omegai;
+    // Guard: avoid sign flip when omegai ≤ 0 (mirrors Fortran finish_cell).
+    const double safe_omega = (omegai > 0.0) ? omegai : fabs(omegai + 1e-300);
+    const double hi_new_raw = hi - funci * dhdrhoi / safe_omega;
+    // Clamp step to ±20% per iteration (mirrors Fortran finish_cell in dens.F90).
+    double hi_new;
+    if      (hi_new_raw > 1.2 * hi) hi_new = 1.2 * hi;
+    else if (hi_new_raw < 0.8 * hi) hi_new = 0.8 * hi;
+    else                             hi_new = hi_new_raw;
 
     rho[i]       = rho_i;
     gradh[i]     = grad_i;
@@ -598,7 +615,14 @@ __global__ void sphDensityKernelLeafWarp(
     const double dhdrhoi = -hi / (3.0 * rho_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
     const double omegai  = 1.0 - dhdrhoi * grad_i;
-    const double hi_new  = hi - funci * dhdrhoi / omegai;
+    // Guard: avoid sign flip when omegai ≤ 0 (mirrors Fortran finish_cell).
+    const double safe_omega = (omegai > 0.0) ? omegai : fabs(omegai + 1e-300);
+    const double hi_new_raw = hi - funci * dhdrhoi / safe_omega;
+    // Clamp step to ±20% per iteration (mirrors Fortran finish_cell in dens.F90).
+    double hi_new;
+    if      (hi_new_raw > 1.2 * hi) hi_new = 1.2 * hi;
+    else if (hi_new_raw < 0.8 * hi) hi_new = 0.8 * hi;
+    else                             hi_new = hi_new_raw;
 
     rho[i]       = rho_i;
     gradh[i]     = grad_i;
