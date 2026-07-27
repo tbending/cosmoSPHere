@@ -22,6 +22,15 @@ BUILDDIR := build
 # Ensure the build output directory exists (a fresh clone has no build/).
 $(shell mkdir -p $(BUILDDIR))
 
+# Force a rebuild when the GPU backend/arch changes. The .cu -> .o mapping is identical
+# for the cuda and hip backends, so without this a cuda<->hip switch silently reuses the
+# wrong-backend objects (and then fails to link, e.g. cuda .o linked with -lamdhip64).
+# Stamp the active config into a file, rewriting it ONLY when it changes so its mtime
+# bumps and the objects below (which list $(TAGFILE) as a prerequisite) recompile.
+BUILD_TAG := $(GPU_BACKEND) $(CUDA_ARCH) $(HIP_ARCH)
+TAGFILE   := $(BUILDDIR)/.build_tag
+$(shell [ "$$(cat $(TAGFILE) 2>/dev/null)" = "$(BUILD_TAG)" ] || printf '%s' "$(BUILD_TAG)" > $(TAGFILE))
+
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
@@ -70,7 +79,7 @@ lib: $(BUILDDIR)/libcosmoSPHere.a
 $(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/dens_c_api.o
 	ar rcs $@ $^
 
-$(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu
+$(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/dens_c_api.d -c -o $@ $<
 
 # Scalar (base) binary
@@ -82,18 +91,18 @@ $(BUILDDIR)/density_hip_unrolled: $(BUILDDIR)/main.unrolled.o $(BUILDDIR)/densit
 	$(GPUCC) $(GPU_FLAGS) -o $@ $^
 
 # Compile rules: each .cu in src/ becomes a .o in build/
-$(BUILDDIR)/density_base.o: src/density_base.cu
+$(BUILDDIR)/density_base.o: src/density_base.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/density_base.d -c -o $@ $<
 
-$(BUILDDIR)/density_unrolled.o: src/density_unrolled.cu
+$(BUILDDIR)/density_unrolled.o: src/density_unrolled.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/density_unrolled.d -c -o $@ $<
 
 # main.cu compiled twice — once for each binary — so the banner can show the
 # correct kernel name.  For now both are identical; we use the same .cu file.
-$(BUILDDIR)/main.base.o: src/main.cu
+$(BUILDDIR)/main.base.o: src/main.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/main.base.d -c -o $@ $<
 
-$(BUILDDIR)/main.unrolled.o: src/main.cu
+$(BUILDDIR)/main.unrolled.o: src/main.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/main.unrolled.d -c -o $@ $<
 
 -include $(BUILDDIR)/*.d
