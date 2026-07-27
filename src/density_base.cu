@@ -54,7 +54,10 @@ using namespace cstone;
 static constexpr unsigned BUCKET_SIZE = 64;
 
 // Newton iteration parameters.
-static constexpr int    MAX_ITER = 10;
+// MAX_ITER matches the CPU's maxdensits=100 headroom (with the +/-20% per-iter
+// clamp, a shock particle can need >>10 iterations); iterations run on the
+// shrinking unconverged set, so the extra budget is cheap.
+static constexpr int    MAX_ITER = 100;
 static constexpr double HTOL     = 1.0e-4;
 
 // ---------------------------------------------------------------------------
@@ -230,8 +233,13 @@ __global__ void sphDensityKernel(const double* __restrict__ x,
     // Guard: if rho_i == 0 (no neighbours), skip update to avoid divide-by-zero.
     if (rho_i == 0.0) { converged[i] = 0; return; }
 
-    const double funci   = pmass * (sph::hfact * hi1) * (sph::hfact * hi1) * (sph::hfact * hi1) - rho_i;
-    const double dhdrhoi = -hi / (3.0 * rho_i);
+    // rho from the h-relation: rhoh(h) = pmass*(hfact/h)^3.  The CPU forms the
+    // Newton Jacobian from THIS density (part.F90 dhdrho = -h/(3*rhoh(h))), NOT
+    // from the SPH sum rho_i.  They coincide only at convergence; using rho_i
+    // off-convergence gives a different step and omega (this fix under test).
+    const double rhoh_i  = pmass * (sph::hfact * hi1) * (sph::hfact * hi1) * (sph::hfact * hi1);
+    const double funci   = rhoh_i - rho_i;
+    const double dhdrhoi = -hi / (3.0 * rhoh_i);
     // omega must use the NORMALISED grad_i (= d(rho)/d(h)), matching Fortran:
     //   gradhi = gradh(i) * cnormk * pmass * hi41
     //   omegai = 1 - dhdrhoi * gradhi
@@ -270,9 +278,13 @@ __global__ void sphDensityKernel(const double* __restrict__ x,
 // → ≤ 27 j-leaves needed.  64 gives a comfortable 2.4× safety margin.
 // ---------------------------------------------------------------------------
 // Estimated max j-leaves per i-leaf: (2*(iHalf+leafHalf)/leafDiam)^3 ≈ 172
-// for max-jiggle h (3.56e-3). 256 gives a safe margin.
-// Memory cost: nLeaves * 256 * 4 = ~160 MB on 10M particles.
-static constexpr int MAX_J_PER_LEAF = 256;
+// for max-jiggle h (3.56e-3). 256 was enough for near-uniform h, but when a
+// particle's h grows during Newton (rarefied/post-shock gas) the search sphere
+// can overlap far more leaves; silently truncating the list under-counts
+// neighbours -> rho too low -> Newton grows h further -> runaway feedback.
+// 1024 + overflow COUNTING (see d_overflow) instead of silent truncation.
+// Memory cost: nLeaves * 1024 * 4 = ~640 MB on 10M particles (fits A100/MI300).
+static constexpr int MAX_J_PER_LEAF = 1024;
 
 // Reverse of internalToLeaf: leaf-CSL index → internal linked-tree node idx.
 // Needed to look up center/size of each i-leaf.
@@ -329,7 +341,8 @@ __global__ void buildJLeafListKernel(
     int              nActiveLeaves,
     const int*       __restrict__ activeLeaves,
     int* __restrict__ jlist,
-    int* __restrict__ jcount)
+    int* __restrict__ jcount,
+    int* __restrict__ overflow)   // [0] += jlist truncations, [1] += stack drops
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= nActiveLeaves) return;
@@ -347,8 +360,12 @@ __global__ void buildJLeafListKernel(
                         iSize[1] + 2.0*hmax,
                         iSize[2] + 2.0*hmax };
 
-    // DFS traversal — stack depth ≤ 7 × tree_depth ≈ 32 for 10M particles.
-    constexpr int MAXSTK = 32;
+    // DFS traversal.  The old bound (7 x tree_depth ~ 32) assumed a NARROW
+    // search sphere; once hmax grows the sphere overlaps many subtrees and the
+    // pending-node count is no longer depth-limited.  Dropping subtrees on
+    // stack overflow silently loses neighbours (same runaway feedback as the
+    // jlist cap), so use a generous stack and COUNT any overflow.
+    constexpr int MAXSTK = 192;
     TreeNodeIndex stack[MAXSTK];
     stack[0] = -1;
     int stackPos = 1;
@@ -384,11 +401,13 @@ __global__ void buildJLeafListKernel(
             else
             {
                 if (stackPos < MAXSTK) stack[stackPos++] = child;
+                else                   atomicAdd(&overflow[1], 1);  // subtree DROPPED
             }
         }
         node = stack[--stackPos];
     } while (node != -1);
 
+    if (count > MAX_J_PER_LEAF) atomicAdd(&overflow[0], count - MAX_J_PER_LEAF);
     jcount[iLeaf] = min(count, MAX_J_PER_LEAF);
 }
 
@@ -480,8 +499,11 @@ __global__ void sphDensityKernelJList(
         return;
     }
 
-    const double funci   = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1) - rho_i;
-    const double dhdrhoi = -hi / (3.0 * rho_i);
+    // dhdrho uses rhoh(h)=pmass*(hfact/h)^3, matching the CPU (part.F90 dhdrho),
+    // NOT the SPH sum rho_i.  See sphDensityKernel for the rationale.
+    const double rhoh_i  = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1);
+    const double funci   = rhoh_i - rho_i;
+    const double dhdrhoi = -hi / (3.0 * rhoh_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
     const double omegai  = 1.0 - dhdrhoi * grad_i;
     // Guard: avoid sign flip when omegai ≤ 0 (mirrors Fortran finish_cell).
@@ -611,8 +633,11 @@ __global__ void sphDensityKernelLeafWarp(
         return;
     }
 
-    const double funci   = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1) - rho_i;
-    const double dhdrhoi = -hi / (3.0 * rho_i);
+    // dhdrho uses rhoh(h)=pmass*(hfact/h)^3, matching the CPU (part.F90 dhdrho),
+    // NOT the SPH sum rho_i.  See sphDensityKernel for the rationale.
+    const double rhoh_i  = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1);
+    const double funci   = rhoh_i - rho_i;
+    const double dhdrhoi = -hi / (3.0 * rhoh_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
     const double omegai  = 1.0 - dhdrhoi * grad_i;
     // Guard: avoid sign flip when omegai ≤ 0 (mirrors Fortran finish_cell).
@@ -779,6 +804,7 @@ DensTimings solveDensH(// Host input/output
             thrust::device_vector<double> d_hmax_leaf(nLeaves);
             thrust::device_vector<int>    d_jlist(nLeaves * MAX_J_PER_LEAF);
             thrust::device_vector<int>    d_jcount(nLeaves);
+            thrust::device_vector<int>    d_overflow(2, 0);  // [0]=jlist trunc, [1]=stack drops
 
             // Active sets — start as all particles / all leaves.
             // After each iteration, compact to unconverged only.
@@ -838,7 +864,8 @@ DensTimings solveDensH(// Host input/output
                         rawPtr(d_centers), rawPtr(d_sizes),
                         rawPtr(octree.childOffsets), rawPtr(octree.internalToLeaf),
                         nActiveLeaves, rawPtr(d_activeLeaves),
-                        rawPtr(d_jlist), rawPtr(d_jcount));
+                        rawPtr(d_jlist), rawPtr(d_jcount),
+                        rawPtr(d_overflow));
                     checkGpuErrors(cudaGetLastError());
                     HIP_CHECK(hipEventRecord(evJB1));
 
@@ -906,6 +933,24 @@ DensTimings solveDensH(// Host input/output
             }
             HIP_CHECK(hipEventRecord(ev4));
             checkGpuErrors(hipEventSynchronize(ev4));
+
+            // ---------------------------------------------------------------
+            // Solver health report: silent failure modes made loud.
+            // nActive>0     -> particles left UNCONVERGED after MAX_ITER
+            //                  (their h/rho/gradh are whatever the last
+            //                  iteration produced — the CPU would fatal here).
+            // overflow[0]>0 -> j-leaf lists truncated (neighbours lost).
+            // overflow[1]>0 -> traversal stack overflow (subtrees dropped).
+            // ---------------------------------------------------------------
+            {
+                int ovf[2] = {0, 0};
+                HIP_CHECK(hipMemcpy(ovf, rawPtr(d_overflow), 2*sizeof(int),
+                                    hipMemcpyDeviceToHost));
+                if (nActive > 0 || ovf[0] > 0 || ovf[1] > 0)
+                    std::fprintf(stderr,
+                        "WARNING! solveDensH: unconverged=%d jlist_trunc=%d stack_drops=%d "
+                        "(iters=%d)\n", nActive, ovf[0], ovf[1], t.itersRun);
+            }
 
             // Download results — use hipMemcpy so transfers land on the default
             // stream and are correctly bracketed by the HIP events.
