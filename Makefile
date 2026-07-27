@@ -19,6 +19,8 @@ CORNERSTONE_DIR ?= ../octree-miniapp
 GPU_BACKEND     ?= cuda          # cuda (default) | hip
 
 BUILDDIR := build
+# Ensure the build output directory exists (a fresh clone has no build/).
+$(shell mkdir -p $(BUILDDIR))
 
 # ---------------------------------------------------------------------------
 # Compiler flags
