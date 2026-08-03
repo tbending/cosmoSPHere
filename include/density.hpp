@@ -49,9 +49,12 @@ struct DensTimings
     double     nodeCenters;     // nodeFpCentersKernel
     double     jleafBuild;      // j-leaf list construction (all iterations)
     double     densKernel;      // density kernel time (all iterations)
+    double     gradJleafBuild;  // j-leaf rebuild over ALL leaves before the grad sweep
     double     gradKernel;      // post-convergence gradient sweep (0 if not requested)
     double     download;        // device-to-host result transfer
     int        itersRun;        // Newton iterations performed
+    int        nParticles;      // particles solved for
+    int        nLeavesOut;      // leaves in the final tree
     KernelMode kernelMode;      // which kernel was used
 };
 

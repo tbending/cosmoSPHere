@@ -879,6 +879,7 @@ DensTimings solveDensH(// Host input/output
     const int ngas = static_cast<int>(x_host.size());
     DensTimings t{};
     t.kernelMode = mode;
+    t.nParticles = ngas;
 
     // CUDA events for fine-grained timing.
     cudaEvent_t evUpload0, evUpload1, evBbox0, evBbox1,
@@ -995,6 +996,7 @@ DensTimings solveDensH(// Host input/output
 
         // Build particle layout (prefix-sum of counts → first particle per leaf).
         const int nLeaves = (int)nNodes(csTree);
+        t.nLeavesOut = nLeaves;
         thrust::device_vector<unsigned> d_layout(nLeaves + 1);
         thrust::exclusive_scan(thrust::device,
                                counts.begin(), counts.end() + 1,
@@ -1194,8 +1196,9 @@ DensTimings solveDensH(// Host input/output
                 d_ddivvdt.resize(ngas);
                 d_dvdx.resize((size_t)9 * ngas);
 
-                cudaEvent_t evG0, evG1;
+                cudaEvent_t evG0, evGJ, evG1;
                 checkGpuErrors(hipEventCreate(&evG0));
+                checkGpuErrors(hipEventCreate(&evGJ));
                 checkGpuErrors(hipEventCreate(&evG1));
                 HIP_CHECK(hipEventRecord(evG0));
 
@@ -1216,6 +1219,7 @@ DensTimings solveDensH(// Host input/output
                     rawPtr(d_jlist), rawPtr(d_jcount),
                     rawPtr(d_overflow));
                 checkGpuErrors(cudaGetLastError());
+                HIP_CHECK(hipEventRecord(evGJ));
 
                 sphGradientsKernel<<<iceil(ngas, 256), 256>>>(
                     rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
@@ -1232,9 +1236,10 @@ DensTimings solveDensH(// Host input/output
                 HIP_CHECK(hipEventRecord(evG1));
                 checkGpuErrors(hipEventSynchronize(evG1));
                 float gms = 0;
-                HIP_CHECK(hipEventElapsedTime(&gms, evG0, evG1));
-                t.gradKernel = gms * 1e-3;
+                HIP_CHECK(hipEventElapsedTime(&gms, evG0, evGJ)); t.gradJleafBuild = gms * 1e-3;
+                HIP_CHECK(hipEventElapsedTime(&gms, evGJ, evG1)); t.gradKernel     = gms * 1e-3;
                 HIP_CHECK(hipEventDestroy(evG0));
+                HIP_CHECK(hipEventDestroy(evGJ));
                 HIP_CHECK(hipEventDestroy(evG1));
             }
 

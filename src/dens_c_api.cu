@@ -31,6 +31,8 @@
 
 #include "density.hpp"
 
+#include <chrono>
+#include <cstdlib>
 #include <vector>
 
 extern "C" void densityiterate_gpu_c(
@@ -52,6 +54,12 @@ extern "C" void densityiterate_gpu_c(
     int           n,
     double        pmass)
 {
+    // Set COSMO_DENS_STATS=1 for a one-line phase breakdown per solve on stderr.
+    // Costs two clock reads when off.
+    static const bool stats = (std::getenv("COSMO_DENS_STATS") != nullptr);
+    using clk = std::chrono::steady_clock;
+    auto t0 = clk::now();
+
     std::vector<double> h_vec(h, h + n);
     std::vector<double> rho_vec(n, 0.0);
     std::vector<double> gradh_vec(n, 0.0);
@@ -63,12 +71,35 @@ extern "C" void densityiterate_gpu_c(
     // raw pointers — they are already flat arrays, so there is nothing to copy.
     GradFields grads{vx, vy, vz, ax, ay, az, divv, dvdx, ddivvdt};
 
-    solveDensH(h_vec, rho_vec, gradh_vec, x_vec, y_vec, z_vec, pmass,
-               KernelMode::FLAT_PARTICLE, &grads);
+    auto t1 = clk::now();
+    DensTimings t = solveDensH(h_vec, rho_vec, gradh_vec, x_vec, y_vec, z_vec, pmass,
+                               KernelMode::FLAT_PARTICLE, &grads);
+    auto t2 = clk::now();
 
     for (int i = 0; i < n; ++i) {
         h[i]         = h_vec[i];
         rho[i]       = rho_vec[i];
         gradh_out[i] = gradh_vec[i];
+    }
+    auto t3 = clk::now();
+
+    if (stats) {
+        auto ms = [](clk::time_point a, clk::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const double solve = ms(t1, t2);
+        const double gpu   = 1e3 * (t.upload + t.bboxAndSetup + t.keysAndSort + t.treeBuild
+                                  + t.nodeCenters + t.jleafBuild + t.densKernel
+                                  + t.gradJleafBuild + t.gradKernel + t.download);
+        std::fprintf(stderr,
+            "COSMO_STATS n=%d leaves=%d iters=%d | vecin=%.2f upload=%.2f bbox=%.2f "
+            "keysort=%.2f tree=%.2f nodes=%.2f jbuild=%.2f nrkern=%.2f gjbuild=%.2f "
+            "gradkern=%.2f download=%.2f | gpusum=%.2f solve=%.2f unaccounted=%.2f "
+            "vecout=%.2f total=%.2f\n",
+            t.nParticles, t.nLeavesOut, t.itersRun,
+            ms(t0, t1), 1e3*t.upload, 1e3*t.bboxAndSetup, 1e3*t.keysAndSort,
+            1e3*t.treeBuild, 1e3*t.nodeCenters, 1e3*t.jleafBuild, 1e3*t.densKernel,
+            1e3*t.gradJleafBuild, 1e3*t.gradKernel, 1e3*t.download,
+            gpu, solve, solve - gpu, ms(t2, t3), ms(t0, t3));
     }
 }
