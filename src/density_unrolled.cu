@@ -641,11 +641,20 @@ DensTimings solveDensH(// Host input/output
                         const std::vector<double>& y_host,
                         const std::vector<double>& z_host,
                         double pmass,
-                        KernelMode mode)
+                        KernelMode mode,
+                        const GradFields* grads)
 {
     const int ngas = static_cast<int>(x_host.size());
     DensTimings t{};
     t.kernelMode = mode;
+
+    // This variant exists only for the standalone unrolled-inner-loop benchmark
+    // and has no gradient sweep; the phantom path uses density_base.cu.
+    if (grads)
+    {
+        std::fprintf(stderr, "solveDensH (unrolled): gradient fields not supported\n");
+        std::abort();
+    }
 
     // CUDA events for fine-grained timing.
     cudaEvent_t evUpload0, evUpload1, evBbox0, evBbox1,

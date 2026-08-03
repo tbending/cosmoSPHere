@@ -49,15 +49,39 @@ struct DensTimings
     double     nodeCenters;     // nodeFpCentersKernel
     double     jleafBuild;      // j-leaf list construction (all iterations)
     double     densKernel;      // density kernel time (all iterations)
+    double     gradKernel;      // post-convergence gradient sweep (0 if not requested)
     double     download;        // device-to-host result transfer
     int        itersRun;        // Newton iterations performed
     KernelMode kernelMode;      // which kernel was used
+};
+
+// Optional second-pass fields: the SPH velocity and acceleration gradients that
+// phantom's densityiterate computes alongside the density.  Supplying this makes
+// solveDensH run ONE extra neighbour sweep after Newton convergence, evaluated at
+// the converged h, and fill divv/dvdx/ddivvdt.  rho and gradh are re-evaluated in
+// the same sweep so that every returned field belongs to the same h (the Newton
+// loop necessarily leaves rho/gradh one step behind h).  Pass nullptr to skip the
+// sweep and get the density-only behaviour.
+//
+// Raw pointers rather than std::vector: these come straight from Fortran arrays
+// through the C API, and the inputs are read-only, so there is nothing to gain
+// from copying them into vectors first.  All arrays are length n except dvdx.
+struct GradFields
+{
+    // inputs
+    const double* vx; const double* vy; const double* vz;   // velocity
+    const double* ax; const double* ay; const double* az;   // acceleration (fxyzu+fext)
+    // outputs
+    double* divv;      // div v
+    double* dvdx;      // velocity gradient tensor, 9*n, particle-major: dvdx[9*i + c]
+    double* ddivvdt;   // d(div v)/dt, the Cullen & Dehnen switch source term
 };
 
 // Solve for smoothing lengths h and densities rho for all particles.
 // h_host is in/out; rho_host and gradh_host are output-only.
 // x/y/z and pmass are read-only inputs.
 // mode selects the GPU density kernel (default: FLAT_PARTICLE).
+// grads is optional — see GradFields above.
 DensTimings solveDensH(std::vector<double>& h_host,
                        std::vector<double>& rho_host,
                        std::vector<double>& gradh_host,
@@ -65,4 +89,5 @@ DensTimings solveDensH(std::vector<double>& h_host,
                        const std::vector<double>& y_host,
                        const std::vector<double>& z_host,
                        double pmass,
-                       KernelMode mode = KernelMode::FLAT_PARTICLE);
+                       KernelMode mode = KernelMode::FLAT_PARTICLE,
+                       const GradFields* grads = nullptr);

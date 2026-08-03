@@ -656,6 +656,213 @@ __global__ void sphDensityKernelLeafWarp(
 }
 
 // ---------------------------------------------------------------------------
+// Post-convergence gradient sweep.
+//
+// Reproduces the non-density half of phantom's densityiterate: the SPH velocity
+// and acceleration gradient sums (dens.F90 get_density_sums) and the per-particle
+// finish that turns them into div v, the strain tensor dv/dx and d(div v)/dt
+// (dens.F90 calculate_rmatrix_from_sums / calculate_divcurlv_from_sums /
+// calculate_strain_from_sums / exactlinear / store_results).
+//
+// Phantom accumulates these sums inside every Newton iteration and throws away
+// all but the last.  Here they are gathered once, after h has converged, which
+// is the same arithmetic on the same neighbour set for strictly less work.
+//
+// rho and gradh are recomputed here too.  They are cheap (the neighbour loop is
+// already running) and it makes every returned field consistent at one h: the
+// Newton kernel necessarily writes rho/gradh evaluated at the h it was *about*
+// to replace, so re-evaluating removes an O(HTOL) mismatch between h and rho.
+//
+// Assumes a single particle type (all masses = pmass), which is what the phantom
+// GPU path passes; the CPU restricts the sums to same-type neighbours.
+// ---------------------------------------------------------------------------
+__global__ void sphGradientsKernel(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const double* __restrict__ z,
+    const double* __restrict__ vx,
+    const double* __restrict__ vy,
+    const double* __restrict__ vz,
+    const double* __restrict__ ax,
+    const double* __restrict__ ay,
+    const double* __restrict__ az,
+    const double* __restrict__ h,        // converged, read-only
+    double*       rho,                   // out, re-evaluated at converged h
+    double*       gradh,                 // out, d(rho)/d(h) at converged h
+    double*       divv,                  // out
+    double*       dvdx,                  // out, component-major: dvdx[c*ngas + i]
+    double*       ddivvdt,               // out
+    int           ngas,
+    double        pmass,
+    const int*       __restrict__ particleLeaf,
+    const int*       __restrict__ jcount,
+    const int*       __restrict__ jlist,
+    const unsigned*  __restrict__ layout)
+{
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= ngas) return;
+
+    const double xi = x[i],  yi = y[i],  zi = z[i];
+    const double vxi = vx[i], vyi = vy[i], vzi = vz[i];
+    const double axi = ax[i], ayi = ay[i], azi = az[i];
+    const double hi  = h[i];
+    const double hi_sq_inv = 1.0 / (hi * hi);
+
+    double rhoi = 0.0, gradhi = 0.0;
+    double divv_s = 0.0;
+    double dv[9] = {0,0,0,0,0,0,0,0,0};
+    double da[9] = {0,0,0,0,0,0,0,0,0};
+    double rxx = 0.0, rxy = 0.0, rxz = 0.0, ryy = 0.0, ryz = 0.0, rzz = 0.0;
+
+    const int iLeaf = particleLeaf[i];
+    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int nj    = jcount[iLeaf];
+
+    for (int jl = 0; jl < nj; ++jl)
+    {
+        const int jLeaf = jlist[jBase + jl];
+        for (unsigned j = layout[jLeaf]; j < layout[jLeaf + 1]; ++j)
+        {
+            const double dx = xi - x[j];
+            const double dy = yi - y[j];
+            const double dz = zi - z[j];
+            const double r2 = dx*dx + dy*dy + dz*dz;
+            const double qij2 = r2 * hi_sq_inv;
+            if (qij2 >= sph::radk2) continue;
+
+            const double qij = sqrt(qij2);
+            double wij, grwij;
+            sph::m4_kern(qij, wij, grwij);
+
+            rhoi   += wij;
+            gradhi += -qij * grwij - 3.0 * wij;
+
+            // Mirrors dens.F90: rij1 = 1/(rij + epsilon(rij)).  The self term has
+            // rij = 0 but also grwij = 0, so it contributes exactly zero here.
+            const double rij  = sqrt(r2);
+            const double rij1 = 1.0 / (rij + 2.220446049250313e-16);
+            const double rij1grkern = rij1 * grwij;
+            const double runix = dx * rij1grkern * pmass;
+            const double runiy = dy * rij1grkern * pmass;
+            const double runiz = dz * rij1grkern * pmass;
+
+            const double dvx = vxi - vx[j];
+            const double dvy = vyi - vy[j];
+            const double dvz = vzi - vz[j];
+
+            divv_s += dvx*runix + dvy*runiy + dvz*runiz;
+
+            dv[0] += dvx*runix; dv[1] += dvx*runiy; dv[2] += dvx*runiz;
+            dv[3] += dvy*runix; dv[4] += dvy*runiy; dv[5] += dvy*runiz;
+            dv[6] += dvz*runix; dv[7] += dvz*runiy; dv[8] += dvz*runiz;
+
+            const double dax = axi - ax[j];
+            const double day = ayi - ay[j];
+            const double daz = azi - az[j];
+
+            da[0] += dax*runix; da[1] += dax*runiy; da[2] += dax*runiz;
+            da[3] += day*runix; da[4] += day*runiy; da[5] += day*runiz;
+            da[6] += daz*runix; da[7] += daz*runiy; da[8] += daz*runiz;
+
+            rxx -= dx*runix; rxy -= dx*runiy; rxz -= dx*runiz;
+            ryy -= dy*runiy; ryz -= dy*runiz; rzz -= dz*runiz;
+        }
+    }
+
+    const double hi1  = 1.0 / hi;
+    const double hi31 = hi1 * hi1 * hi1;
+    const double hi41 = hi31 * hi1;
+
+    const double rho_i  = rhoi   * sph::cnormk * pmass * hi31;
+    const double grad_i = gradhi * sph::cnormk * pmass * hi41;
+
+    rho[i]   = rho_i;
+    gradh[i] = grad_i;
+
+    if (!(rho_i > 0.0))
+    {
+        divv[i] = 0.0; ddivvdt[i] = 0.0;
+        for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = 0.0;
+        return;
+    }
+
+    // 1/omega, formed exactly as the phantom wrapper forms gradh(1,i) from the
+    // values returned here (gpu_dens_iface.F90) — omega = 1 + h/(3 rho) drho/dh,
+    // using the SPH-summed rho.  Both sides must agree: store_results feeds this
+    // same 1/omega into the term below.
+    const double omega = 1.0 + (hi / (3.0 * rho_i)) * grad_i;
+    const double omega_inv = (omega > 0.0) ? (1.0 / omega) : 1.0;
+
+    // dens.F90 store_results: term = cnormk*gradhi*rho1i*hi41, gradhi = 1/omega.
+    const double term = sph::cnormk * omega_inv * hi41 / rho_i;
+
+    // calculate_rmatrix_from_sums
+    const double denom = rxx*ryy*rzz + 2.0*rxy*rxz*ryz
+                       - rxx*ryz*ryz - ryy*rxz*rxz - rzz*rxy*rxy;
+    const double rm0 = ryy*rzz - ryz*ryz;   // xx
+    const double rm1 = rxz*ryz - rzz*rxy;   // xy
+    const double rm2 = rxy*ryz - rxz*ryy;   // xz
+    const double rm3 = rzz*rxx - rxz*rxz;   // yy
+    const double rm4 = rxy*rxz - rxx*ryz;   // yz
+    const double rm5 = rxx*ryy - rxy*rxy;   // zz
+
+    // divcurlvi(1) always uses the plain SPH estimate, never exact-linear.
+    divv[i] = -divv_s * term;
+
+    double g[9];      // velocity gradient tensor, phantom's dvdx ordering
+    double div_a;
+
+    // tiny(denom) for double precision
+    if (fabs(denom) > 2.2250738585072014e-308)
+    {
+        const double dd = 1.0 / denom;
+        // exactlinear, applied row-wise to the velocity and acceleration sums
+        for (int row = 0; row < 3; ++row)
+        {
+            const double sx = dv[3*row], sy = dv[3*row+1], sz = dv[3*row+2];
+            g[3*row  ] = -(sx*rm0 + sy*rm1 + sz*rm2) * dd;
+            g[3*row+1] = -(sx*rm1 + sy*rm3 + sz*rm4) * dd;
+            g[3*row+2] = -(sx*rm2 + sy*rm4 + sz*rm5) * dd;
+        }
+        double grada_diag = 0.0;
+        for (int row = 0; row < 3; ++row)
+        {
+            const double sx = da[3*row], sy = da[3*row+1], sz = da[3*row+2];
+            const double gax = (sx*rm0 + sy*rm1 + sz*rm2) * dd;
+            const double gay = (sx*rm1 + sy*rm3 + sz*rm4) * dd;
+            const double gaz = (sx*rm2 + sy*rm4 + sz*rm5) * dd;
+            grada_diag += (row == 0) ? gax : ((row == 1) ? gay : gaz);
+        }
+        div_a = -grada_diag;
+    }
+    else
+    {
+        for (int c = 0; c < 9; ++c) g[c] = -dv[c] * term;
+        div_a = -term * (da[0] + da[4] + da[8]);
+    }
+
+    for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = g[c];
+
+    // divcurlvi(5): div_a minus the nonlinear tr(dv.dv) term
+    ddivvdt[i] = div_a - (g[0]*g[0] + g[4]*g[4] + g[8]*g[8]
+                          + 2.0*(g[1]*g[3] + g[2]*g[6] + g[5]*g[7]));
+}
+
+// Undo the Hilbert sort for the 9-component tensor and interleave it into the
+// (9,n) layout phantom expects, in one pass: out[9*orig + c] = in[c*ngas + srt].
+__global__ void scatterDvdxKernel(const double* __restrict__ in,
+                                  const int*    __restrict__ order,
+                                  double*       __restrict__ out,
+                                  int ngas)
+{
+    int srt = blockDim.x * blockIdx.x + threadIdx.x;
+    if (srt >= ngas) return;
+    const int orig = order[srt];
+    for (int c = 0; c < 9; ++c)
+        out[(size_t)9*orig + c] = in[(size_t)c*ngas + srt];
+}
+
+// ---------------------------------------------------------------------------
 
 DensTimings solveDensH(// Host input/output
                         std::vector<double>& h_host,
@@ -666,7 +873,8 @@ DensTimings solveDensH(// Host input/output
                         const std::vector<double>& y_host,
                         const std::vector<double>& z_host,
                         double pmass,
-                        KernelMode mode)
+                        KernelMode mode,
+                        const GradFields* grads)
 {
     const int ngas = static_cast<int>(x_host.size());
     DensTimings t{};
@@ -687,6 +895,18 @@ DensTimings solveDensH(// Host input/output
     thrust::device_vector<double> d_h(h_host);
     thrust::device_vector<double> d_rho(ngas, 0.0), d_gradh(ngas, 0.0);
     thrust::device_vector<int>    d_converged(ngas, 0);
+    // Velocity and acceleration are only needed for the post-convergence
+    // gradient sweep; leave the vectors empty (no allocation) otherwise.
+    thrust::device_vector<double> d_vx, d_vy, d_vz, d_ax, d_ay, d_az;
+    if (grads)
+    {
+        d_vx.assign(grads->vx, grads->vx + ngas);
+        d_vy.assign(grads->vy, grads->vy + ngas);
+        d_vz.assign(grads->vz, grads->vz + ngas);
+        d_ax.assign(grads->ax, grads->ax + ngas);
+        d_ay.assign(grads->ay, grads->ay + ngas);
+        d_az.assign(grads->az, grads->az + ngas);
+    }
     HIP_CHECK(hipEventRecord(evUpload1));
 
     // -----------------------------------------------------------------------
@@ -742,6 +962,14 @@ DensTimings solveDensH(// Host input/output
         thrust::swap(d_z, d_tmp);
         thrust::gather(d_order.begin(), d_order.end(), d_h.begin(), d_tmp.begin());
         thrust::swap(d_h, d_tmp);
+        if (grads)
+        {
+            for (auto* v : {&d_vx, &d_vy, &d_vz, &d_ax, &d_ay, &d_az})
+            {
+                thrust::gather(d_order.begin(), d_order.end(), v->begin(), d_tmp.begin());
+                thrust::swap(*v, d_tmp);
+            }
+        }
 
         // -----------------------------------------------------------------------
         // Step 2 — Cornerstone leaf tree + linked tree
@@ -952,6 +1180,64 @@ DensTimings solveDensH(// Host input/output
                         "(iters=%d)\n", nActive, ovf[0], ovf[1], t.itersRun);
             }
 
+            // ---------------------------------------------------------------
+            // Post-convergence gradient sweep (optional).
+            //
+            // The Newton loop left the j-leaf lists covering only the last
+            // active set, so rebuild them for EVERY leaf at the converged h
+            // before sweeping all particles once.
+            // ---------------------------------------------------------------
+            thrust::device_vector<double> d_divv, d_ddivvdt, d_dvdx;
+            if (grads)
+            {
+                d_divv.resize(ngas);
+                d_ddivvdt.resize(ngas);
+                d_dvdx.resize((size_t)9 * ngas);
+
+                cudaEvent_t evG0, evG1;
+                checkGpuErrors(hipEventCreate(&evG0));
+                checkGpuErrors(hipEventCreate(&evG1));
+                HIP_CHECK(hipEventRecord(evG0));
+
+                thrust::sequence(d_activeLeaves.begin(), d_activeLeaves.end());
+                nActiveLeaves = nLeaves;
+
+                computeHmaxLeafKernel<<<iceil(nActiveLeaves, 256), 256>>>(
+                    rawPtr(d_h), rawPtr(d_layout),
+                    nActiveLeaves, rawPtr(d_activeLeaves),
+                    rawPtr(d_hmax_leaf));
+                checkGpuErrors(cudaGetLastError());
+
+                buildJLeafListKernel<<<iceil(nActiveLeaves, 256), 256>>>(
+                    rawPtr(d_leafToInternal), rawPtr(d_hmax_leaf),
+                    rawPtr(d_centers), rawPtr(d_sizes),
+                    rawPtr(octree.childOffsets), rawPtr(octree.internalToLeaf),
+                    nActiveLeaves, rawPtr(d_activeLeaves),
+                    rawPtr(d_jlist), rawPtr(d_jcount),
+                    rawPtr(d_overflow));
+                checkGpuErrors(cudaGetLastError());
+
+                sphGradientsKernel<<<iceil(ngas, 256), 256>>>(
+                    rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
+                    rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
+                    rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
+                    rawPtr(d_h), rawPtr(d_rho), rawPtr(d_gradh),
+                    rawPtr(d_divv), rawPtr(d_dvdx), rawPtr(d_ddivvdt),
+                    ngas, pmass,
+                    rawPtr(d_particleLeaf),
+                    rawPtr(d_jcount), rawPtr(d_jlist),
+                    rawPtr(d_layout));
+                checkGpuErrors(cudaGetLastError());
+
+                HIP_CHECK(hipEventRecord(evG1));
+                checkGpuErrors(hipEventSynchronize(evG1));
+                float gms = 0;
+                HIP_CHECK(hipEventElapsedTime(&gms, evG0, evG1));
+                t.gradKernel = gms * 1e-3;
+                HIP_CHECK(hipEventDestroy(evG0));
+                HIP_CHECK(hipEventDestroy(evG1));
+            }
+
             // Download results — use hipMemcpy so transfers land on the default
             // stream and are correctly bracketed by the HIP events.
             // Results are in Hilbert-sorted order; scatter back to original
@@ -965,6 +1251,21 @@ DensTimings solveDensH(// Host input/output
                 HIP_CHECK(hipMemcpy(rho_host.data(),   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
                 thrust::scatter(d_gradh.begin(),d_gradh.end(),d_order.begin(), d_out.begin());
                 HIP_CHECK(hipMemcpy(gradh_host.data(), rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+
+                if (grads)
+                {
+                    thrust::scatter(d_divv.begin(), d_divv.end(), d_order.begin(), d_out.begin());
+                    HIP_CHECK(hipMemcpy(grads->divv, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+                    thrust::scatter(d_ddivvdt.begin(), d_ddivvdt.end(), d_order.begin(), d_out.begin());
+                    HIP_CHECK(hipMemcpy(grads->ddivvdt, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+
+                    thrust::device_vector<double> d_dvdxOut((size_t)9 * ngas);
+                    scatterDvdxKernel<<<iceil(ngas, 256), 256>>>(
+                        rawPtr(d_dvdx), rawPtr(d_order), rawPtr(d_dvdxOut), ngas);
+                    checkGpuErrors(cudaGetLastError());
+                    HIP_CHECK(hipMemcpy(grads->dvdx, rawPtr(d_dvdxOut),
+                                        (size_t)9*ngas*sizeof(double), hipMemcpyDeviceToHost));
+                }
             }
             HIP_CHECK(hipEventRecord(evDl1));
             checkGpuErrors(hipEventSynchronize(evDl1));
