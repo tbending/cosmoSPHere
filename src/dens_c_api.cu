@@ -32,6 +32,7 @@
 #include "density.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 
@@ -94,8 +95,8 @@ extern "C" void densityiterate_gpu_c(
         std::fprintf(stderr,
             "COSMO_STATS n=%d leaves=%d iters=%d | vecin=%.2f upload=%.2f bbox=%.2f "
             "keysort=%.2f tree=%.2f nodes=%.2f jbuild=%.2f nrkern=%.2f gjbuild=%.2f "
-            "gradkern=%.2f download=%.2f | gpusum=%.2f solve=%.2f unaccounted=%.2f "
-            "vecout=%.2f total=%.2f\n",
+            "gradkern=%.2f download=%.2f | gpusum=%.2f "
+            "solve=%.2f unaccounted=%.2f vecout=%.2f total=%.2f\n",
             t.nParticles, t.nLeavesOut, t.itersRun,
             ms(t0, t1), 1e3*t.upload, 1e3*t.bboxAndSetup, 1e3*t.keysAndSort,
             1e3*t.treeBuild, 1e3*t.nodeCenters, 1e3*t.jleafBuild, 1e3*t.densKernel,

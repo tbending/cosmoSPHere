@@ -76,21 +76,29 @@ all: $(BUILDDIR)/density_hip $(BUILDDIR)/density_hip_unrolled
 # ---------------------------------------------------------------------------
 lib: $(BUILDDIR)/libcosmoSPHere.a
 
-$(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/dens_c_api.o
+$(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/tree.o $(BUILDDIR)/gpu_state.o $(BUILDDIR)/dens_c_api.o
 	ar rcs $@ $^
 
 $(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/dens_c_api.d -c -o $@ $<
 
 # Scalar (base) binary
-$(BUILDDIR)/density_hip: $(BUILDDIR)/main.base.o $(BUILDDIR)/density_base.o
+$(BUILDDIR)/density_hip: $(BUILDDIR)/main.base.o $(BUILDDIR)/density_base.o \
+                         $(BUILDDIR)/tree.o $(BUILDDIR)/gpu_state.o
 	$(GPUCC) $(GPU_FLAGS) -o $@ $^
 
 # 4x-unrolled binary
-$(BUILDDIR)/density_hip_unrolled: $(BUILDDIR)/main.unrolled.o $(BUILDDIR)/density_unrolled.o
+$(BUILDDIR)/density_hip_unrolled: $(BUILDDIR)/main.unrolled.o $(BUILDDIR)/density_unrolled.o \
+                                  $(BUILDDIR)/gpu_state.o
 	$(GPUCC) $(GPU_FLAGS) -o $@ $^
 
 # Compile rules: each .cu in src/ becomes a .o in build/
+$(BUILDDIR)/tree.o: src/tree.cu $(TAGFILE)
+	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/tree.d -c -o $@ $<
+
+$(BUILDDIR)/gpu_state.o: src/gpu_state.cu $(TAGFILE)
+	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/gpu_state.d -c -o $@ $<
+
 $(BUILDDIR)/density_base.o: src/density_base.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/density_base.d -c -o $@ $<
 

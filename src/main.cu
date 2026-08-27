@@ -12,6 +12,7 @@
  * paste them side-by-side for comparison.
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>

@@ -1,9 +1,13 @@
 /*
  * density.hpp — Public interface for the Cornerstone GPU density solver.
  *
- * Only include this header from non-GPU translation units (e.g. main.cu
- * could include it, but caller only needs DensTimings + solveDensH).
- * The full GPU implementation lives in density.cu.
+ * Includable from NON-GPU translation units: no thrust, no cornerstone.  A consumer
+ * that just wants densities — a resolution-changing tool, an analysis pass — includes
+ * this and nothing else.
+ *
+ * The device buffers and the octree live in the process-wide GpuState (gpu_state.hpp)
+ * and persist between calls, so a caller that solves repeatedly pays the allocation
+ * cost once.  Callers never see it.
  */
 
 #pragma once
@@ -12,17 +16,6 @@
 #include <cstdlib>
 #include <vector>
 
-// Error-checking macro for all HIP API calls.
-// Prints file/line on failure and aborts.
-#define HIP_CHECK(call)                                                        \
-    do {                                                                       \
-        hipError_t _e = (call);                                                \
-        if (_e != hipSuccess) {                                                \
-            std::fprintf(stderr, "HIP error %s:%d  %s\n",                     \
-                         __FILE__, __LINE__, hipGetErrorString(_e));           \
-            std::abort();                                                      \
-        }                                                                      \
-    } while (0)
 
 // Selects which GPU density kernel is used inside the Newton iteration.
 //
@@ -85,6 +78,9 @@ struct GradFields
 // x/y/z and pmass are read-only inputs.
 // mode selects the GPU density kernel (default: FLAT_PARTICLE).
 // grads is optional — see GradFields above.
+//
+// Leaves the tree, the Hilbert-sorted particle data and the leaf bookkeeping in the
+// shared state, so a repeated solve reuses the allocations — see gpu_state.hpp.
 DensTimings solveDensH(std::vector<double>& h_host,
                        std::vector<double>& rho_host,
                        std::vector<double>& gradh_host,

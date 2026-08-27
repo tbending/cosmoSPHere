@@ -1,24 +1,24 @@
 /*
- * density.cuh — GPU density + smoothing-length solver using a Cornerstone octree.
+ * density_base.cu — SPH density and gradient kernels, and the Newton solve.
+ *
+ * Physics only.  Everything about the octree — building it, deriving node geometry
+ * and walking it for neighbour leaves — lives in tree.cuh / tree.cu.
  *
  * Pipeline:
- *   1. Compute 64-bit Hilbert keys for all particles on the GPU.
- *   2. Sort particles into Hilbert order (GPU radix sort via Thrust).
- *   3. Build adaptive cornerstone leaf tree (GPU, updateOctreeGpu loop).
- *   4. Build fully-linked internal octree (GPU, buildLinkedTreeGpu).
- *   5. Compute floating-point node centres and half-sizes (GPU kernel).
- *   6. Run one (or more) Newton–Raphson steps: each GPU thread traverses the
- *      octree for its own particle, accumulates rho and grad-h, and updates h.
+ *   1. Upload, then buildTree(): Hilbert keys, GPU sort, cornerstone leaf tree,
+ *      fully-linked octree, node centres, leaf/particle maps.
+ *   2. Newton-Raphson for h: each iteration rebuilds hmax and the gather j-leaf list
+ *      for the still-unconverged leaves, then runs one density kernel over them.
+ *   3. One post-convergence sweep for div v, dv/dx and d(div v)/dt, re-evaluating
+ *      rho and gradh at the converged h so every returned field belongs to one h.
  *
  * The Newton step faithfully reproduces the Fortran solve_dens_h logic from
- * cosmoSPHere/src/dens.f90 — same kernel, same variable reuse order, same
- * meaning of gradhi (unnormalised accumulator) in the omega formula.
- *
- * Convergence tolerance and maximum iterations are compile-time tunable below.
+ * cosmoSPHere/src/dens.f90 — same kernel, same variable reuse order, same meaning of
+ * gradhi (unnormalised accumulator) in the omega formula.
  */
 
-// DensTimings struct and solveDensH declaration live in density.hpp.
 #include "density.hpp"
+#include "tree.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -31,27 +31,13 @@
 #include <thrust/scan.h>
 #include <thrust/sequence.h>
 #include <thrust/gather.h>
+#include <thrust/scatter.h>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 #include <thrust/copy.h>
-
-#include "util/annotation.hpp"
-#include "util/cuda_utils.hpp"
-#include "sfc/box.hpp"
-#include "sfc/hilbert.hpp"
-#include "tree/csarray.hpp"
-#include "tree/csarray_gpu.cuh"
-#include "tree/octree.hpp"
-#include "tree/octree_gpu.cuh"
+#include <thrust/iterator/permutation_iterator.h>
 
 #include "kernel.hpp"
-
-using namespace cstone;
-
-// Maximum particles per octree leaf node.
-// Smaller = finer tree (more nodes, shorter j-loops per node).
-// 64 is a good balance for O(50) neighbours; tune if needed.
-static constexpr unsigned BUCKET_SIZE = 64;
 
 // Newton iteration parameters.
 // MAX_ITER matches the CPU's maxdensits=100 headroom (with the +/-20% per-iter
@@ -59,41 +45,6 @@ static constexpr unsigned BUCKET_SIZE = 64;
 // shrinking unconverged set, so the extra budget is cheap.
 static constexpr int    MAX_ITER = 100;
 static constexpr double HTOL     = 1.0e-4;
-
-// ---------------------------------------------------------------------------
-// GPU kernel: compute Hilbert keys for all particles
-// ---------------------------------------------------------------------------
-__global__ void computeHilbertKeysKernel(const double* __restrict__ x,
-                                         const double* __restrict__ y,
-                                         const double* __restrict__ z,
-                                         uint64_t* __restrict__ keys,
-                                         int n,
-                                         Box<double> box)
-{
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i < n)
-        keys[i] = hilbert3D<uint64_t>(x[i], y[i], z[i], box);
-}
-
-// ---------------------------------------------------------------------------
-// GPU kernel: compute floating-point node centres and half-sizes from prefixes
-// ---------------------------------------------------------------------------
-__global__ void nodeFpCentersKernel(const uint64_t* __restrict__ prefixes,
-                                    int numNodes,
-                                    Vec3<double>* __restrict__ centers,
-                                    Vec3<double>* __restrict__ sizes,
-                                    Box<double> box)
-{
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i >= numNodes) return;
-
-    uint64_t prefix   = prefixes[i];
-    uint64_t startKey = decodePlaceholderBit(prefix);
-    unsigned level    = decodePrefixLength(prefix) / 3;
-    IBox     nodeBox  = hilbertIBox(startKey, level);
-
-    util::tie(centers[i], sizes[i]) = centerAndSize<uint64_t>(nodeBox, box);
-}
 
 // ---------------------------------------------------------------------------
 // GPU kernel: one Newton step per particle.
@@ -259,156 +210,6 @@ __global__ void sphDensityKernel(const double* __restrict__ x,
 
     const double relChange = fabs((hi_new - hi) / hi_old);
     converged[i] = (relChange < HTOL) ? 1 : 0;
-}
-
-// ---------------------------------------------------------------------------
-// Host function: build tree + run density solve, return timing breakdowns.
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// J-leaf list infrastructure.
-//
-// Instead of each particle doing its own DFS (with a costly register-heavy
-// stack), we pre-build one j-leaf list per i-leaf.  With Hilbert ordering
-// and warpSize = 64 = BUCKET_SIZE on AMD MI300X, every warp is exactly one
-// i-leaf.  All 64 lanes share the same j-leaf list → 64× cache reuse.
-// The 156 k DFS traversals needed to build the lists cost < 1 ms.
-//
-// Fixed-stride layout: jlist[iLeaf * MAX_J_PER_LEAF + k], k ∈ [0, jcount[iLeaf]).
-// Geometry: 2h ≈ 3e-3, leaf side ≈ 18e-3 → search sphere spans ≤ 3 leaf widths
-// → ≤ 27 j-leaves needed.  64 gives a comfortable 2.4× safety margin.
-// ---------------------------------------------------------------------------
-// Estimated max j-leaves per i-leaf: (2*(iHalf+leafHalf)/leafDiam)^3 ≈ 172
-// for max-jiggle h (3.56e-3). 256 was enough for near-uniform h, but when a
-// particle's h grows during Newton (rarefied/post-shock gas) the search sphere
-// can overlap far more leaves; silently truncating the list under-counts
-// neighbours -> rho too low -> Newton grows h further -> runaway feedback.
-// 1024 + overflow COUNTING (see d_overflow) instead of silent truncation.
-// Memory cost: nLeaves * 1024 * 4 = ~640 MB on 10M particles (fits A100/MI300).
-static constexpr int MAX_J_PER_LEAF = 1024;
-
-// Reverse of internalToLeaf: leaf-CSL index → internal linked-tree node idx.
-// Needed to look up center/size of each i-leaf.
-__global__ void buildLeafToInternalKernel(
-    const TreeNodeIndex* __restrict__ childOffsets,
-    const TreeNodeIndex* __restrict__ internalToLeaf,
-    int numNodes,
-    TreeNodeIndex* __restrict__ leafToInternal)
-{
-    int node = blockDim.x * blockIdx.x + threadIdx.x;
-    if (node >= numNodes) return;
-    if (childOffsets[node] == 0)  // childOffsets == 0 marks a leaf
-        leafToInternal[internalToLeaf[node]] = node;
-}
-
-// For each particle, record which leaf it belongs to.
-// With Hilbert order, all particles in layout[iLeaf..iLeaf+1) are adjacent.
-__global__ void buildParticleToLeafKernel(
-    const unsigned* __restrict__ layout,
-    int nLeaves,
-    int* __restrict__ particleLeaf)
-{
-    int iLeaf = blockDim.x * blockIdx.x + threadIdx.x;
-    if (iLeaf >= nLeaves) return;
-    for (unsigned j = layout[iLeaf]; j < layout[iLeaf + 1]; ++j)
-        particleLeaf[j] = iLeaf;
-}
-
-// Maximum h in each active leaf — indexed via activeLeaves indirection.
-__global__ void computeHmaxLeafKernel(
-    const double*    __restrict__ h,
-    const unsigned*  __restrict__ layout,
-    int              nActiveLeaves,
-    const int*       __restrict__ activeLeaves,
-    double*          __restrict__ hmax_leaf)
-{
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= nActiveLeaves) return;
-    int iLeaf = activeLeaves[idx];
-    double hmax = 0.0;
-    for (unsigned j = layout[iLeaf]; j < layout[iLeaf + 1]; ++j)
-        if (isfinite(h[j])) hmax = fmax(hmax, h[j]);
-    hmax_leaf[iLeaf] = hmax;
-}
-
-// Single-pass DFS for each active i-leaf, indexed via activeLeaves indirection.
-__global__ void buildJLeafListKernel(
-    const TreeNodeIndex* __restrict__ leafToInternal,
-    const double*         __restrict__ hmax_leaf,
-    const Vec3<double>*   __restrict__ centers,
-    const Vec3<double>*   __restrict__ sizes,
-    const TreeNodeIndex*  __restrict__ childOffsets,
-    const TreeNodeIndex*  __restrict__ internalToLeaf,
-    int              nActiveLeaves,
-    const int*       __restrict__ activeLeaves,
-    int* __restrict__ jlist,
-    int* __restrict__ jcount,
-    int* __restrict__ overflow)   // [0] += jlist truncations, [1] += stack drops
-{
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    if (idx >= nActiveLeaves) return;
-    int iLeaf = activeLeaves[idx];
-
-    TreeNodeIndex iNode  = leafToInternal[iLeaf];
-    Vec3<double>  iCenter = centers[iNode];
-    Vec3<double>  iSize   = sizes[iNode];
-    double        hmax    = hmax_leaf[iLeaf];
-    // Guard: if all h in this leaf were non-finite, hmax==0 → use iSize only
-    // (no real neighbours needed; density kernel will guard the update too).
-    if (!isfinite(hmax) || hmax <= 0.0) hmax = 0.0;
-    // Expand the i-leaf's bounding box by 2·hmax on every side.
-    Vec3<double> iHalf{ iSize[0] + 2.0*hmax,
-                        iSize[1] + 2.0*hmax,
-                        iSize[2] + 2.0*hmax };
-
-    // DFS traversal.  The old bound (7 x tree_depth ~ 32) assumed a NARROW
-    // search sphere; once hmax grows the sphere overlaps many subtrees and the
-    // pending-node count is no longer depth-limited.  Dropping subtrees on
-    // stack overflow silently loses neighbours (same runaway feedback as the
-    // jlist cap), so use a generous stack and COUNT any overflow.
-    constexpr int MAXSTK = 192;
-    TreeNodeIndex stack[MAXSTK];
-    stack[0] = -1;
-    int stackPos = 1;
-    int count    = 0;
-    int jBase    = iLeaf * MAX_J_PER_LEAF;
-
-    // Check root overlap.
-    if (norm2(minDistance(iCenter, iHalf, centers[0], sizes[0])) > 0.0)
-    {
-        jcount[iLeaf] = 0;
-        return;
-    }
-    if (childOffsets[0] == 0)  // root is itself a leaf
-    {
-        if (count < MAX_J_PER_LEAF) jlist[jBase + count] = internalToLeaf[0];
-        jcount[iLeaf] = 1;
-        return;
-    }
-
-    TreeNodeIndex node = 0;
-    do {
-        for (int oct = 0; oct < 8; ++oct)
-        {
-            TreeNodeIndex child = childOffsets[node] + oct;
-            if (norm2(minDistance(iCenter, iHalf, centers[child], sizes[child])) > 0.0)
-                continue;
-            if (childOffsets[child] == 0)
-            {
-                if (count < MAX_J_PER_LEAF)
-                    jlist[jBase + count] = internalToLeaf[child];
-                ++count;
-            }
-            else
-            {
-                if (stackPos < MAXSTK) stack[stackPos++] = child;
-                else                   atomicAdd(&overflow[1], 1);  // subtree DROPPED
-            }
-        }
-        node = stack[--stackPos];
-    } while (node != -1);
-
-    if (count > MAX_J_PER_LEAF) atomicAdd(&overflow[0], count - MAX_J_PER_LEAF);
-    jcount[iLeaf] = min(count, MAX_J_PER_LEAF);
 }
 
 // ---------------------------------------------------------------------------
@@ -862,8 +663,10 @@ __global__ void scatterDvdxKernel(const double* __restrict__ in,
         out[(size_t)9*orig + c] = in[(size_t)c*ngas + srt];
 }
 
-// ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Host driver: build the tree, solve for h, then sweep the gradients.
+// ---------------------------------------------------------------------------
 DensTimings solveDensH(// Host input/output
                         std::vector<double>& h_host,
                         std::vector<double>& rho_host,
@@ -876,419 +679,287 @@ DensTimings solveDensH(// Host input/output
                         KernelMode mode,
                         const GradFields* grads)
 {
+    // One GPU, one state.  force_gpu_c picks up the same one.
+    GpuState& s = gpuState();
+
     const int ngas = static_cast<int>(x_host.size());
     DensTimings t{};
     t.kernelMode = mode;
     t.nParticles = ngas;
 
-    // CUDA events for fine-grained timing.
-    cudaEvent_t evUpload0, evUpload1, evBbox0, evBbox1,
-                ev0, ev1, ev2, ev3, evJB0, evJB1, ev4, evDl0, evDl1;
-    for (auto* e : {&evUpload0, &evUpload1, &evBbox0, &evBbox1,
-                    &ev0, &ev1, &ev2, &ev3, &evJB0, &evJB1, &ev4, &evDl0, &evDl1})
+    cudaEvent_t evUpload0, evUpload1, ev3, evJB0, evJB1, ev4, evDl0, evDl1;
+    for (auto* e : {&evUpload0, &evUpload1, &ev3, &evJB0, &evJB1, &ev4, &evDl0, &evDl1})
         checkGpuErrors(hipEventCreate(e));
 
     // -----------------------------------------------------------------------
-    // Upload particle data to GPU
+    // Upload.  Buffers force needs after this call returns live in `s`; the rest are
+    // local.  Everything is resized then fully overwritten, so reuse across calls
+    // cannot leak values from the previous step.
     // -----------------------------------------------------------------------
     HIP_CHECK(hipEventRecord(evUpload0));
-    thrust::device_vector<double> d_x(x_host), d_y(y_host), d_z(z_host);
-    thrust::device_vector<double> d_h(h_host);
-    thrust::device_vector<double> d_rho(ngas, 0.0), d_gradh(ngas, 0.0);
-    thrust::device_vector<int>    d_converged(ngas, 0);
-    // Velocity and acceleration are only needed for the post-convergence
-    // gradient sweep; leave the vectors empty (no allocation) otherwise.
-    thrust::device_vector<double> d_vx, d_vy, d_vz, d_ax, d_ay, d_az;
+    s.ngas = ngas;
+    s.x.assign(x_host.begin(), x_host.end());
+    s.y.assign(y_host.begin(), y_host.end());
+    s.z.assign(z_host.begin(), z_host.end());
+    s.h.assign(h_host.begin(), h_host.end());
+    s.rho.assign(ngas, 0.0);
+    s.gradh.assign(ngas, 0.0);
+    thrust::device_vector<int> d_converged(ngas, 0);
+
+    // Velocity and acceleration are only needed for the gradient sweep.  Velocity
+    // persists because force needs it; acceleration does not.
+    thrust::device_vector<double> d_ax, d_ay, d_az;
+    s.vx.clear(); s.vy.clear(); s.vz.clear();
+    std::vector<thrust::device_vector<double>*> alsoSort;
     if (grads)
     {
-        d_vx.assign(grads->vx, grads->vx + ngas);
-        d_vy.assign(grads->vy, grads->vy + ngas);
-        d_vz.assign(grads->vz, grads->vz + ngas);
+        s.vx.assign(grads->vx, grads->vx + ngas);
+        s.vy.assign(grads->vy, grads->vy + ngas);
+        s.vz.assign(grads->vz, grads->vz + ngas);
         d_ax.assign(grads->ax, grads->ax + ngas);
         d_ay.assign(grads->ay, grads->ay + ngas);
         d_az.assign(grads->az, grads->az + ngas);
+        alsoSort = {&s.vx, &s.vy, &s.vz, &d_ax, &d_ay, &d_az};
     }
     HIP_CHECK(hipEventRecord(evUpload1));
 
     // -----------------------------------------------------------------------
-    // Bounding box — compute entirely on GPU using Thrust reductions.
-    // Avoids 6 serial host loops over 10M elements.
+    // Tree.  Leaves `s` holding the Hilbert ordering, the octree, node geometry and
+    // the leaf/particle maps — all of which outlive this call for the force pass.
     // -----------------------------------------------------------------------
-    HIP_CHECK(hipEventRecord(evBbox0));
-    double xmin, xmax, ymin, ymax, zmin, zmax;
+    TreeTimings tt;
+    buildTree(s, alsoSort, tt);
+    t.bboxAndSetup = tt.bbox;
+    t.keysAndSort  = tt.keysSort;
+    t.treeBuild    = tt.build;
+    t.nodeCenters  = tt.nodes;
+    t.nLeavesOut   = s.nLeaves;
+
+    const int nLeaves = s.nLeaves;
+
+    // Active sets — start as all particles / all leaves, compacted to the
+    // unconverged ones after each iteration.
+    thrust::device_vector<int> d_activeParticles(ngas);
+    thrust::device_vector<int> d_activeTmp(ngas);       // scratch for copy_if
+    thrust::device_vector<int> d_activeLeaves(nLeaves);
+    thrust::device_vector<int> d_activeLeavesTmp(ngas); // scratch (ngas upper bound)
+    thrust::sequence(d_activeParticles.begin(), d_activeParticles.end());
+    thrust::sequence(d_activeLeaves.begin(),   d_activeLeaves.end());
+    int nActive       = ngas;
+    int nActiveLeaves = nLeaves;
+
+    // -----------------------------------------------------------------------
+    // Newton iteration.  Each pass:
+    //   a) rebuild hmax + gather j-leaf list, for the active leaves only
+    //   b) one density kernel over the active particles
+    //   c) compact the active sets to whatever is still unconverged
+    //
+    // The list is rebuilt every iteration rather than once up front: h can grow as
+    // well as shrink (the step is clamped to +/-20% either way), and a list built
+    // from too-small an h silently loses neighbours, which feeds back as runaway h.
+    // -----------------------------------------------------------------------
+    HIP_CHECK(hipEventRecord(ev3));
     {
-        auto [xlo, xhi] = thrust::minmax_element(thrust::device, d_x.begin(), d_x.end());
-        auto [ylo, yhi] = thrust::minmax_element(thrust::device, d_y.begin(), d_y.end());
-        auto [zlo, zhi] = thrust::minmax_element(thrust::device, d_z.begin(), d_z.end());
-        // Dereferencing device iterators triggers an implicit device→host copy.
-        xmin = *xlo; xmax = *xhi;
-        ymin = *ylo; ymax = *yhi;
-        zmin = *zlo; zmax = *zhi;
+        constexpr int BLK2 = 256;
+
+        for (int iter = 0; iter < MAX_ITER; ++iter)
+        {
+            HIP_CHECK(hipEventRecord(evJB0));
+            computeHmaxLeafKernel<<<iceil(nActiveLeaves, 256), 256>>>(
+                rawPtr(s.h), rawPtr(s.layout),
+                nActiveLeaves, rawPtr(d_activeLeaves),
+                rawPtr(s.hmax_leaf));
+            checkGpuErrors(cudaGetLastError());
+
+            buildJLeafListKernel<<<iceil(nActiveLeaves, 256), 256>>>(
+                rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf),
+                rawPtr(s.centers), rawPtr(s.sizes),
+                rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
+                nActiveLeaves, rawPtr(d_activeLeaves),
+                rawPtr(s.jlist), rawPtr(s.jcount),
+                rawPtr(s.overflow));
+            checkGpuErrors(cudaGetLastError());
+            HIP_CHECK(hipEventRecord(evJB1));
+
+            if (mode == KernelMode::WARP_PER_LEAF)
+            {
+                sphDensityKernelLeafWarp<<<nActiveLeaves, BUCKET_SIZE>>>(
+                    rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+                    rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
+                    nActiveLeaves, rawPtr(d_activeLeaves),
+                    pmass,
+                    rawPtr(s.jcount), rawPtr(s.jlist),
+                    rawPtr(s.layout));
+            }
+            else
+            {
+                sphDensityKernelJList<<<iceil(nActive, BLK2), BLK2>>>(
+                    rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+                    rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
+                    nActive, rawPtr(d_activeParticles),
+                    pmass,
+                    rawPtr(s.particleLeaf),
+                    rawPtr(s.jcount), rawPtr(s.jlist),
+                    rawPtr(s.layout));
+            }
+            checkGpuErrors(cudaGetLastError());
+
+            // Accumulate j-leaf build time.
+            checkGpuErrors(hipEventSynchronize(evJB1));
+            float jms = 0;
+            HIP_CHECK(hipEventElapsedTime(&jms, evJB0, evJB1));
+            t.jleafBuild += jms * 1e-3;
+
+            // Compact unconverged particles into d_activeTmp.
+            // Predicate reads d_converged[activeParticles[j]] via permutation iterator.
+            auto pred = thrust::logical_not<int>();
+            auto permIt = thrust::make_permutation_iterator(
+                d_converged.begin(), d_activeParticles.begin());
+            auto newEnd = thrust::copy_if(
+                thrust::device,
+                d_activeParticles.begin(),
+                d_activeParticles.begin() + nActive,
+                permIt,
+                d_activeTmp.begin(),
+                pred);
+            t.itersRun = iter + 1;
+            nActive    = static_cast<int>(newEnd - d_activeTmp.begin());
+            thrust::swap(d_activeParticles, d_activeTmp);
+
+            if (nActive == 0) break;
+
+            // New active-leaf set: map active particles -> their leaves, sort+unique.
+            thrust::gather(thrust::device,
+                d_activeParticles.begin(), d_activeParticles.begin() + nActive,
+                s.particleLeaf.begin(), d_activeLeavesTmp.begin());
+            thrust::sort(thrust::device,
+                d_activeLeavesTmp.begin(), d_activeLeavesTmp.begin() + nActive);
+            auto leafEnd = thrust::unique(thrust::device,
+                d_activeLeavesTmp.begin(), d_activeLeavesTmp.begin() + nActive);
+            nActiveLeaves = static_cast<int>(leafEnd - d_activeLeavesTmp.begin());
+            thrust::copy(thrust::device,
+                d_activeLeavesTmp.begin(), d_activeLeavesTmp.begin() + nActiveLeaves,
+                d_activeLeaves.begin());
+        }
     }
-    HIP_CHECK(hipEventRecord(evBbox1));
+    HIP_CHECK(hipEventRecord(ev4));
+    checkGpuErrors(hipEventSynchronize(ev4));
 
-    // Pad box slightly (mirrors Fortran *1.00001 on the largest side).
-    double maxSpan = std::max({xmax-xmin, ymax-ymin, zmax-zmin}) * 1.00001;
-    double xctr = 0.5*(xmin+xmax), yctr = 0.5*(ymin+ymax), zctr = 0.5*(zmin+zmax);
-    double half = 0.5 * maxSpan;
-    Box<double> box{xctr - half, xctr + half,
-                    yctr - half, yctr + half,
-                    zctr - half, zctr + half,
-                    BoundaryType::open};
-
-    // -----------------------------------------------------------------------
-    // Step 1 — Hilbert keys + GPU sort
-    // -----------------------------------------------------------------------
-    HIP_CHECK(hipEventRecord(ev0));
+    // ---------------------------------------------------------------
+    // Solver health report: silent failure modes made loud.
+    // nActive>0     -> particles left UNCONVERGED after MAX_ITER (their
+    //                  h/rho/gradh are whatever the last iteration produced —
+    //                  the CPU would fatal here).
+    // overflow[0]>0 -> j-leaf lists truncated (neighbours lost).
+    // overflow[1]>0 -> traversal stack overflow (subtrees dropped).
+    // ---------------------------------------------------------------
     {
-        thrust::device_vector<uint64_t> d_keys(ngas);
+        int ovf[2] = {0, 0};
+        HIP_CHECK(hipMemcpy(ovf, rawPtr(s.overflow), 2*sizeof(int), hipMemcpyDeviceToHost));
+        if (nActive > 0 || ovf[0] > 0 || ovf[1] > 0)
+            std::fprintf(stderr,
+                "WARNING! solveDensH: unconverged=%d jlist_trunc=%d stack_drops=%d "
+                "(iters=%d)\n", nActive, ovf[0], ovf[1], t.itersRun);
+    }
 
-        constexpr int BLK = 256;
-        computeHilbertKeysKernel<<<iceil(ngas, BLK), BLK>>>(
-            rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
-            rawPtr(d_keys), ngas, box);
+    // ---------------------------------------------------------------
+    // Post-convergence gradient sweep (optional).
+    //
+    // The Newton loop left the j-leaf lists covering only the last active set, so
+    // rebuild them for EVERY leaf at the converged h before sweeping all particles
+    // once.  That full-tree hmax pass is also what the force walk relies on.
+    // ---------------------------------------------------------------
+    thrust::device_vector<double> d_divv, d_ddivvdt, d_dvdx;
+    if (grads)
+    {
+        d_divv.resize(ngas);
+        d_ddivvdt.resize(ngas);
+        d_dvdx.resize((size_t)9 * ngas);
+
+        cudaEvent_t evG0, evGJ, evG1;
+        checkGpuErrors(hipEventCreate(&evG0));
+        checkGpuErrors(hipEventCreate(&evGJ));
+        checkGpuErrors(hipEventCreate(&evG1));
+        HIP_CHECK(hipEventRecord(evG0));
+
+        thrust::sequence(d_activeLeaves.begin(), d_activeLeaves.end());
+        nActiveLeaves = nLeaves;
+
+        computeHmaxLeafKernel<<<iceil(nActiveLeaves, 256), 256>>>(
+            rawPtr(s.h), rawPtr(s.layout),
+            nActiveLeaves, rawPtr(d_activeLeaves),
+            rawPtr(s.hmax_leaf));
         checkGpuErrors(cudaGetLastError());
 
-        // Sort permutation by Hilbert key, then gather particle data.
-        thrust::device_vector<int> d_order(ngas);
-        thrust::sequence(d_order.begin(), d_order.end());
-        thrust::sort_by_key(d_keys.begin(), d_keys.end(), d_order.begin());
+        buildJLeafListKernel<<<iceil(nActiveLeaves, 256), 256>>>(
+            rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf),
+            rawPtr(s.centers), rawPtr(s.sizes),
+            rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
+            nActiveLeaves, rawPtr(d_activeLeaves),
+            rawPtr(s.jlist), rawPtr(s.jcount),
+            rawPtr(s.overflow));
+        checkGpuErrors(cudaGetLastError());
+        HIP_CHECK(hipEventRecord(evGJ));
 
-        thrust::device_vector<double> d_tmp(ngas);
-        thrust::gather(d_order.begin(), d_order.end(), d_x.begin(), d_tmp.begin());
-        thrust::swap(d_x, d_tmp);
-        thrust::gather(d_order.begin(), d_order.end(), d_y.begin(), d_tmp.begin());
-        thrust::swap(d_y, d_tmp);
-        thrust::gather(d_order.begin(), d_order.end(), d_z.begin(), d_tmp.begin());
-        thrust::swap(d_z, d_tmp);
-        thrust::gather(d_order.begin(), d_order.end(), d_h.begin(), d_tmp.begin());
-        thrust::swap(d_h, d_tmp);
+        sphGradientsKernel<<<iceil(ngas, 256), 256>>>(
+            rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+            rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
+            rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
+            rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh),
+            rawPtr(d_divv), rawPtr(d_dvdx), rawPtr(d_ddivvdt),
+            ngas, pmass,
+            rawPtr(s.particleLeaf),
+            rawPtr(s.jcount), rawPtr(s.jlist),
+            rawPtr(s.layout));
+        checkGpuErrors(cudaGetLastError());
+
+        HIP_CHECK(hipEventRecord(evG1));
+        checkGpuErrors(hipEventSynchronize(evG1));
+        float gms = 0;
+        HIP_CHECK(hipEventElapsedTime(&gms, evG0, evGJ)); t.gradJleafBuild = gms * 1e-3;
+        HIP_CHECK(hipEventElapsedTime(&gms, evGJ, evG1)); t.gradKernel     = gms * 1e-3;
+        HIP_CHECK(hipEventDestroy(evG0));
+        HIP_CHECK(hipEventDestroy(evGJ));
+        HIP_CHECK(hipEventDestroy(evG1));
+    }
+
+    // Download — hipMemcpy so the transfers land on the default stream and are
+    // correctly bracketed by the events.  Results are in Hilbert order; scatter back
+    // to phantom's order with s.order (sorted index -> original index).
+    HIP_CHECK(hipEventRecord(evDl0));
+    {
+        thrust::device_vector<double> d_out(ngas);
+        thrust::scatter(s.h.begin(),     s.h.end(),     s.order.begin(), d_out.begin());
+        HIP_CHECK(hipMemcpy(h_host.data(),     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        thrust::scatter(s.rho.begin(),   s.rho.end(),   s.order.begin(), d_out.begin());
+        HIP_CHECK(hipMemcpy(rho_host.data(),   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        thrust::scatter(s.gradh.begin(), s.gradh.end(), s.order.begin(), d_out.begin());
+        HIP_CHECK(hipMemcpy(gradh_host.data(), rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+
         if (grads)
         {
-            for (auto* v : {&d_vx, &d_vy, &d_vz, &d_ax, &d_ay, &d_az})
-            {
-                thrust::gather(d_order.begin(), d_order.end(), v->begin(), d_tmp.begin());
-                thrust::swap(*v, d_tmp);
-            }
-        }
+            thrust::scatter(d_divv.begin(), d_divv.end(), s.order.begin(), d_out.begin());
+            HIP_CHECK(hipMemcpy(grads->divv, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+            thrust::scatter(d_ddivvdt.begin(), d_ddivvdt.end(), s.order.begin(), d_out.begin());
+            HIP_CHECK(hipMemcpy(grads->ddivvdt, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
 
-        // -----------------------------------------------------------------------
-        // Step 2 — Cornerstone leaf tree + linked tree
-        // -----------------------------------------------------------------------
-        HIP_CHECK(hipEventRecord(ev1));
-
-        thrust::device_vector<uint64_t>       csTree = std::vector<uint64_t>{0, nodeRange<uint64_t>(0)};
-        thrust::device_vector<unsigned>        counts = std::vector<unsigned>{(unsigned)ngas};
-        thrust::device_vector<uint64_t>        tmpTree;
-        thrust::device_vector<TreeNodeIndex>   workArray;
-
-        // d_keys is already sorted — run update until tree converges.
-        while (!updateOctreeGpu(rawPtr(d_keys), rawPtr(d_keys) + ngas,
-                                BUCKET_SIZE, csTree, counts, tmpTree, workArray))
-        {
-            // iterate until stable leaf partition
-        }
-
-        OctreeData<uint64_t, GpuTag> octree;
-        octree.resize(nNodes(csTree));
-        buildLinkedTreeGpu(rawPtr(csTree), octree.data());
-        checkGpuErrors(cudaGetLastError());
-
-        // Build particle layout (prefix-sum of counts → first particle per leaf).
-        const int nLeaves = (int)nNodes(csTree);
-        t.nLeavesOut = nLeaves;
-        thrust::device_vector<unsigned> d_layout(nLeaves + 1);
-        thrust::exclusive_scan(thrust::device,
-                               counts.begin(), counts.end() + 1,
-                               d_layout.begin(), 0u);
-
-        // -----------------------------------------------------------------------
-        // Step 3 — Node centres and sizes
-        // -----------------------------------------------------------------------
-        HIP_CHECK(hipEventRecord(ev2));
-        {
-            int numNodes = octree.numNodes;
-            thrust::device_vector<Vec3<double>> d_centers(numNodes), d_sizes(numNodes);
-
-            nodeFpCentersKernel<<<iceil(numNodes, 256), 256>>>(
-                rawPtr(octree.prefixes), numNodes,
-                rawPtr(d_centers), rawPtr(d_sizes), box);
+            thrust::device_vector<double> d_dvdxOut((size_t)9 * ngas);
+            scatterDvdxKernel<<<iceil(ngas, 256), 256>>>(
+                rawPtr(d_dvdx), rawPtr(s.order), rawPtr(d_dvdxOut), ngas);
             checkGpuErrors(cudaGetLastError());
-
-            // -----------------------------------------------------------------------
-            // J-leaf list infrastructure.
-            // leafToInternal and particleLeaf are stable after tree build.
-            // activeLeaves + activeParticles shrink each Newton iteration.
-            // -----------------------------------------------------------------------
-            thrust::device_vector<TreeNodeIndex> d_leafToInternal(nLeaves, -1);
-            buildLeafToInternalKernel<<<iceil(numNodes, 256), 256>>>(
-                rawPtr(octree.childOffsets), rawPtr(octree.internalToLeaf),
-                numNodes, rawPtr(d_leafToInternal));
-            checkGpuErrors(cudaGetLastError());
-
-            thrust::device_vector<int> d_particleLeaf(ngas);
-            buildParticleToLeafKernel<<<iceil(nLeaves, 256), 256>>>(
-                rawPtr(d_layout), nLeaves, rawPtr(d_particleLeaf));
-            checkGpuErrors(cudaGetLastError());
-
-            thrust::device_vector<double> d_hmax_leaf(nLeaves);
-            thrust::device_vector<int>    d_jlist(nLeaves * MAX_J_PER_LEAF);
-            thrust::device_vector<int>    d_jcount(nLeaves);
-            thrust::device_vector<int>    d_overflow(2, 0);  // [0]=jlist trunc, [1]=stack drops
-
-            // Active sets — start as all particles / all leaves.
-            // After each iteration, compact to unconverged only.
-            thrust::device_vector<int> d_activeParticles(ngas);
-            thrust::device_vector<int> d_activeTmp(ngas);       // scratch for copy_if
-            thrust::device_vector<int> d_activeLeaves(nLeaves);
-            thrust::device_vector<int> d_activeLeavesTmp(ngas); // scratch (ngas upper bound)
-            thrust::sequence(d_activeParticles.begin(), d_activeParticles.end());
-            thrust::sequence(d_activeLeaves.begin(),   d_activeLeaves.end());
-            int nActive       = ngas;
-            int nActiveLeaves = nLeaves;
-
-            // -----------------------------------------------------------------------
-            // Step 4 — Build j-leaf list ONCE before the Newton loop.
-            //
-            // The j-leaf list is constructed using the initial h values, which are
-            // the largest each particle's h will ever be during Newton convergence:
-            // the NR update always moves h toward the equilibrium value, which means
-            // h can only *decrease* from an over-estimated starting value (e.g. after
-            // jiggle) or converge from either side, but never grows beyond the value
-            // that caused the leaf's hmax.  The per-particle qij<radk check in the
-            // kernel provides the exact spatial cutoff, so a conservative (too-large)
-            // j-leaf list is correct — the only cost is extra j-particle inner-loop
-            // iterations that fail the distance test.
-            //
-            // This eliminates nActiveLeaves DFS traversals × (MAX_ITER-1) iterations.
-            // For 10M particles with jiggle: saves ~9 × 2ms = 18 ms of j-list build.
-            // For the Fortran-equivalent case the walk is also pre-built once.
-            //
-            // Caveat: if h grows significantly during Newton (e.g. particle starts
-            // with h too small relative to its converged value), some true neighbours
-            // may be missed on later iterations.  For well-initialised SPH simulations
-            // this is rare; where it matters, rebuild the list mid-solve.
-            // -----------------------------------------------------------------------
-            // -----------------------------------------------------------------------
-            // Step 4 — Newton iteration.
-            // Each iteration:
-            //   a) rebuild hmax + j-leaf list for active leaves only.
-            //   b) run density kernel for active particles only.
-            //   c) compact active sets to unconverged particles/leaves.
-            // -----------------------------------------------------------------------
-            HIP_CHECK(hipEventRecord(ev3));
-            {
-                constexpr int BLK2 = 256;
-
-                for (int iter = 0; iter < MAX_ITER; ++iter)
-                {
-                    HIP_CHECK(hipEventRecord(evJB0));
-                    computeHmaxLeafKernel<<<iceil(nActiveLeaves, 256), 256>>>(
-                        rawPtr(d_h), rawPtr(d_layout),
-                        nActiveLeaves, rawPtr(d_activeLeaves),
-                        rawPtr(d_hmax_leaf));
-                    checkGpuErrors(cudaGetLastError());
-
-                    buildJLeafListKernel<<<iceil(nActiveLeaves, 256), 256>>>( 
-                        rawPtr(d_leafToInternal), rawPtr(d_hmax_leaf),
-                        rawPtr(d_centers), rawPtr(d_sizes),
-                        rawPtr(octree.childOffsets), rawPtr(octree.internalToLeaf),
-                        nActiveLeaves, rawPtr(d_activeLeaves),
-                        rawPtr(d_jlist), rawPtr(d_jcount),
-                        rawPtr(d_overflow));
-                    checkGpuErrors(cudaGetLastError());
-                    HIP_CHECK(hipEventRecord(evJB1));
-
-                    if (mode == KernelMode::WARP_PER_LEAF)
-                    {
-                        sphDensityKernelLeafWarp<<<nActiveLeaves, BUCKET_SIZE>>>(
-                            rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
-                            rawPtr(d_h), rawPtr(d_rho), rawPtr(d_gradh), rawPtr(d_converged),
-                            nActiveLeaves, rawPtr(d_activeLeaves),
-                            pmass,
-                            rawPtr(d_jcount), rawPtr(d_jlist),
-                            rawPtr(d_layout));
-                    }
-                    else
-                    {
-                        sphDensityKernelJList<<<iceil(nActive, BLK2), BLK2>>>(
-                            rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
-                            rawPtr(d_h), rawPtr(d_rho), rawPtr(d_gradh), rawPtr(d_converged),
-                            nActive, rawPtr(d_activeParticles),
-                            pmass,
-                            rawPtr(d_particleLeaf),
-                            rawPtr(d_jcount), rawPtr(d_jlist),
-                            rawPtr(d_layout));
-                    }
-                    checkGpuErrors(cudaGetLastError());
-
-                    // Accumulate j-leaf build time.
-                    checkGpuErrors(hipEventSynchronize(evJB1));
-                    float jms = 0;
-                    HIP_CHECK(hipEventElapsedTime(&jms, evJB0, evJB1));
-                    t.jleafBuild += jms * 1e-3;
-
-                    // Compact unconverged particles into d_activeTmp.
-                    // Predicate reads d_converged[activeParticles[j]] via permutation iterator.
-                    auto pred = thrust::logical_not<int>();
-                    auto permIt = thrust::make_permutation_iterator(
-                        d_converged.begin(), d_activeParticles.begin());
-                    auto newEnd = thrust::copy_if(
-                        thrust::device,
-                        d_activeParticles.begin(),
-                        d_activeParticles.begin() + nActive,
-                        permIt,
-                        d_activeTmp.begin(),
-                        pred);
-                    t.itersRun = iter + 1;
-                    nActive    = static_cast<int>(newEnd - d_activeTmp.begin());
-                    thrust::swap(d_activeParticles, d_activeTmp);
-
-                    if (nActive == 0) break;
-
-                    // Build the new active-leaf set:
-                    // map active particles → their leaves, sort+unique.
-                    thrust::gather(thrust::device,
-                        d_activeParticles.begin(), d_activeParticles.begin() + nActive,
-                        d_particleLeaf.begin(), d_activeLeavesTmp.begin());
-                    thrust::sort(thrust::device,
-                        d_activeLeavesTmp.begin(), d_activeLeavesTmp.begin() + nActive);
-                    auto leafEnd = thrust::unique(thrust::device,
-                        d_activeLeavesTmp.begin(), d_activeLeavesTmp.begin() + nActive);
-                    nActiveLeaves = static_cast<int>(leafEnd - d_activeLeavesTmp.begin());
-                    thrust::copy(thrust::device,
-                        d_activeLeavesTmp.begin(), d_activeLeavesTmp.begin() + nActiveLeaves,
-                        d_activeLeaves.begin());
-                }
-            }
-            HIP_CHECK(hipEventRecord(ev4));
-            checkGpuErrors(hipEventSynchronize(ev4));
-
-            // ---------------------------------------------------------------
-            // Solver health report: silent failure modes made loud.
-            // nActive>0     -> particles left UNCONVERGED after MAX_ITER
-            //                  (their h/rho/gradh are whatever the last
-            //                  iteration produced — the CPU would fatal here).
-            // overflow[0]>0 -> j-leaf lists truncated (neighbours lost).
-            // overflow[1]>0 -> traversal stack overflow (subtrees dropped).
-            // ---------------------------------------------------------------
-            {
-                int ovf[2] = {0, 0};
-                HIP_CHECK(hipMemcpy(ovf, rawPtr(d_overflow), 2*sizeof(int),
-                                    hipMemcpyDeviceToHost));
-                if (nActive > 0 || ovf[0] > 0 || ovf[1] > 0)
-                    std::fprintf(stderr,
-                        "WARNING! solveDensH: unconverged=%d jlist_trunc=%d stack_drops=%d "
-                        "(iters=%d)\n", nActive, ovf[0], ovf[1], t.itersRun);
-            }
-
-            // ---------------------------------------------------------------
-            // Post-convergence gradient sweep (optional).
-            //
-            // The Newton loop left the j-leaf lists covering only the last
-            // active set, so rebuild them for EVERY leaf at the converged h
-            // before sweeping all particles once.
-            // ---------------------------------------------------------------
-            thrust::device_vector<double> d_divv, d_ddivvdt, d_dvdx;
-            if (grads)
-            {
-                d_divv.resize(ngas);
-                d_ddivvdt.resize(ngas);
-                d_dvdx.resize((size_t)9 * ngas);
-
-                cudaEvent_t evG0, evGJ, evG1;
-                checkGpuErrors(hipEventCreate(&evG0));
-                checkGpuErrors(hipEventCreate(&evGJ));
-                checkGpuErrors(hipEventCreate(&evG1));
-                HIP_CHECK(hipEventRecord(evG0));
-
-                thrust::sequence(d_activeLeaves.begin(), d_activeLeaves.end());
-                nActiveLeaves = nLeaves;
-
-                computeHmaxLeafKernel<<<iceil(nActiveLeaves, 256), 256>>>(
-                    rawPtr(d_h), rawPtr(d_layout),
-                    nActiveLeaves, rawPtr(d_activeLeaves),
-                    rawPtr(d_hmax_leaf));
-                checkGpuErrors(cudaGetLastError());
-
-                buildJLeafListKernel<<<iceil(nActiveLeaves, 256), 256>>>(
-                    rawPtr(d_leafToInternal), rawPtr(d_hmax_leaf),
-                    rawPtr(d_centers), rawPtr(d_sizes),
-                    rawPtr(octree.childOffsets), rawPtr(octree.internalToLeaf),
-                    nActiveLeaves, rawPtr(d_activeLeaves),
-                    rawPtr(d_jlist), rawPtr(d_jcount),
-                    rawPtr(d_overflow));
-                checkGpuErrors(cudaGetLastError());
-                HIP_CHECK(hipEventRecord(evGJ));
-
-                sphGradientsKernel<<<iceil(ngas, 256), 256>>>(
-                    rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
-                    rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
-                    rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
-                    rawPtr(d_h), rawPtr(d_rho), rawPtr(d_gradh),
-                    rawPtr(d_divv), rawPtr(d_dvdx), rawPtr(d_ddivvdt),
-                    ngas, pmass,
-                    rawPtr(d_particleLeaf),
-                    rawPtr(d_jcount), rawPtr(d_jlist),
-                    rawPtr(d_layout));
-                checkGpuErrors(cudaGetLastError());
-
-                HIP_CHECK(hipEventRecord(evG1));
-                checkGpuErrors(hipEventSynchronize(evG1));
-                float gms = 0;
-                HIP_CHECK(hipEventElapsedTime(&gms, evG0, evGJ)); t.gradJleafBuild = gms * 1e-3;
-                HIP_CHECK(hipEventElapsedTime(&gms, evGJ, evG1)); t.gradKernel     = gms * 1e-3;
-                HIP_CHECK(hipEventDestroy(evG0));
-                HIP_CHECK(hipEventDestroy(evGJ));
-                HIP_CHECK(hipEventDestroy(evG1));
-            }
-
-            // Download results — use hipMemcpy so transfers land on the default
-            // stream and are correctly bracketed by the HIP events.
-            // Results are in Hilbert-sorted order; scatter back to original
-            // particle order using d_order (which maps sorted index → original index).
-            HIP_CHECK(hipEventRecord(evDl0));
-            {
-                thrust::device_vector<double> d_out(ngas);
-                thrust::scatter(d_h.begin(),    d_h.end(),    d_order.begin(), d_out.begin());
-                HIP_CHECK(hipMemcpy(h_host.data(),     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-                thrust::scatter(d_rho.begin(),  d_rho.end(),  d_order.begin(), d_out.begin());
-                HIP_CHECK(hipMemcpy(rho_host.data(),   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-                thrust::scatter(d_gradh.begin(),d_gradh.end(),d_order.begin(), d_out.begin());
-                HIP_CHECK(hipMemcpy(gradh_host.data(), rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-
-                if (grads)
-                {
-                    thrust::scatter(d_divv.begin(), d_divv.end(), d_order.begin(), d_out.begin());
-                    HIP_CHECK(hipMemcpy(grads->divv, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-                    thrust::scatter(d_ddivvdt.begin(), d_ddivvdt.end(), d_order.begin(), d_out.begin());
-                    HIP_CHECK(hipMemcpy(grads->ddivvdt, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-
-                    thrust::device_vector<double> d_dvdxOut((size_t)9 * ngas);
-                    scatterDvdxKernel<<<iceil(ngas, 256), 256>>>(
-                        rawPtr(d_dvdx), rawPtr(d_order), rawPtr(d_dvdxOut), ngas);
-                    checkGpuErrors(cudaGetLastError());
-                    HIP_CHECK(hipMemcpy(grads->dvdx, rawPtr(d_dvdxOut),
-                                        (size_t)9*ngas*sizeof(double), hipMemcpyDeviceToHost));
-                }
-            }
-            HIP_CHECK(hipEventRecord(evDl1));
-            checkGpuErrors(hipEventSynchronize(evDl1));
+            HIP_CHECK(hipMemcpy(grads->dvdx, rawPtr(d_dvdxOut),
+                                (size_t)9*ngas*sizeof(double), hipMemcpyDeviceToHost));
         }
     }
+    HIP_CHECK(hipEventRecord(evDl1));
+    checkGpuErrors(hipEventSynchronize(evDl1));
 
-    // Collect timings (ms -> s).
     float ms = 0;
-    HIP_CHECK(hipEventElapsedTime(&ms, evUpload0, evUpload1)); t.upload       = ms * 1e-3;
-    HIP_CHECK(hipEventElapsedTime(&ms, evBbox0,   evBbox1));   t.bboxAndSetup = ms * 1e-3;
-    HIP_CHECK(hipEventElapsedTime(&ms, ev0,       ev1));        t.keysAndSort  = ms * 1e-3;
-    HIP_CHECK(hipEventElapsedTime(&ms, ev1,       ev2));        t.treeBuild    = ms * 1e-3;
-    HIP_CHECK(hipEventElapsedTime(&ms, ev2,       ev3));        t.nodeCenters  = ms * 1e-3;
-    HIP_CHECK(hipEventElapsedTime(&ms, ev3,       ev4));        t.densKernel   = ms * 1e-3 - t.jleafBuild;
-    HIP_CHECK(hipEventElapsedTime(&ms, evDl0,     evDl1));      t.download     = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, evUpload0, evUpload1)); t.upload     = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, ev3,       ev4));       t.densKernel = ms * 1e-3 - t.jleafBuild;
+    HIP_CHECK(hipEventElapsedTime(&ms, evDl0,     evDl1));     t.download   = ms * 1e-3;
 
-    for (auto* e : {&evUpload0, &evUpload1, &evBbox0, &evBbox1,
-                    &ev0, &ev1, &ev2, &ev3, &evJB0, &evJB1, &ev4, &evDl0, &evDl1})
+    for (auto* e : {&evUpload0, &evUpload1, &ev3, &evJB0, &evJB1, &ev4, &evDl0, &evDl1})
         HIP_CHECK(hipEventDestroy(*e));
 
     return t;

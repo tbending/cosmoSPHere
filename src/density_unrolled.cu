@@ -19,6 +19,7 @@
 
 // DensTimings struct and solveDensH declaration live in density.hpp.
 #include "density.hpp"
+#include "gpu_check.hpp"
 
 #include <algorithm>
 #include <cmath>
