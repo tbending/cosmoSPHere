@@ -6,11 +6,14 @@
  * can hold a neighbour.  The density solve (density_base.cu) and the force pass
  * (force.cu) both sit on top of it.
  *
- * The kernels are `static`: a plain __global__ defined in a header is emitted in
- * every translation unit that includes it and the definitions collide at link time.
- * static gives each TU its own copy — a few KB of fatbin, no collision.  Cornerstone's
- * own *_gpu.cuh headers have the same problem and are NOT included here for that
- * reason; tree.cu includes them directly.
+ * The non-template kernels are `static`: a plain __global__ defined in a header is
+ * emitted in every translation unit that includes it and the definitions collide at
+ * link time.  static gives each TU its own copy — a few KB of fatbin, no collision.
+ * Cornerstone's own *_gpu.cuh headers have the same problem and are NOT included
+ * here for that reason; tree.cu includes them directly.
+ *
+ * buildJLeafListKernel stays a template in a header because density needs <false>
+ * and force <true>; in a .cu that would take explicit instantiation naming both.
  */
 
 #pragma once
@@ -138,10 +141,70 @@ static __global__ void computeHmaxLeafKernel(
     hmax_leaf[iLeaf] = hmax;
 }
 
+// Largest h anywhere beneath each node.  Launched once per tree level, DEEPEST
+// FIRST, so a node's 8 children are final when it is read.  Leaves occur at every
+// level, hence the childOffsets==0 branch rather than a separate leaf pass.
+static __global__ void hmaxUpsweepKernel(TreeNodeIndex first,
+                                         TreeNodeIndex last,
+                                         const TreeNodeIndex* __restrict__ childOffsets,
+                                         const TreeNodeIndex* __restrict__ internalToLeaf,
+                                         const double*        __restrict__ hmax_leaf,
+                                         double*              __restrict__ hmax_node)
+{
+    TreeNodeIndex i = first + blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= last) return;
+
+    TreeNodeIndex c = childOffsets[i];
+    if (c == 0)                                  // leaf at this level
+    {
+        double hm = hmax_leaf[internalToLeaf[i]];
+        hmax_node[i] = (isfinite(hm) && hm > 0.0) ? hm : 0.0;
+        return;
+    }
+
+    double m = 0.0;
+    for (int o = 0; o < 8; ++o) m = fmax(m, hmax_node[c + o]);
+    hmax_node[i] = m;
+}
+
+/*! @brief Can node @p node hold a particle interacting with one in the i-leaf?
+ *
+ * Symmetric=false (density): radius 2*hmax_i, applied by inflating the i-box.
+ * Symmetric=true  (force):   radius 2*max(hmax_i, hmax_node).  Depends on the
+ *     candidate, so the i-box cannot be pre-inflated; tested as a Euclidean distance
+ *     between the raw boxes, which is tighter than inflate-and-overlap and costs the
+ *     same.
+ */
+template<bool Symmetric>
+__device__ inline bool nodeInRange(const Vec3<double>& iCenter,
+                                   const Vec3<double>& iSize,
+                                   const Vec3<double>& iHalf,
+                                   double              twoHi,
+                                   const double* __restrict__ hmax_node,
+                                   TreeNodeIndex node,
+                                   const Vec3<double>* __restrict__ centers,
+                                   const Vec3<double>* __restrict__ sizes)
+{
+    if constexpr (Symmetric)
+    {
+        const double rs = fmax(twoHi, 2.0 * hmax_node[node]);
+        return norm2(minDistance(iCenter, iSize, centers[node], sizes[node])) <= rs * rs;
+    }
+    else
+    {
+        return norm2(minDistance(iCenter, iHalf, centers[node], sizes[node])) <= 0.0;
+    }
+}
+
 // Single-pass DFS for each active i-leaf, indexed via activeLeaves indirection.
-static __global__ void buildJLeafListKernel(
+// Symmetric=false: gather only (density); hmax_node may be nullptr.
+// Symmetric=true : gather + scatter (force); hmax_node must cover all numNodes,
+//                  i.e. hmaxUpsweepKernel must have run over the whole tree.
+template<bool Symmetric>
+__global__ void buildJLeafListKernel(
     const TreeNodeIndex* __restrict__ leafToInternal,
     const double*         __restrict__ hmax_leaf,
+    const double*         __restrict__ hmax_node,
     const Vec3<double>*   __restrict__ centers,
     const Vec3<double>*   __restrict__ sizes,
     const TreeNodeIndex*  __restrict__ childOffsets,
@@ -163,10 +226,12 @@ static __global__ void buildJLeafListKernel(
     // Guard: if all h in this leaf were non-finite, hmax==0 → use iSize only
     // (no real neighbours needed; density kernel will guard the update too).
     if (!isfinite(hmax) || hmax <= 0.0) hmax = 0.0;
-    // Expand the i-leaf's bounding box by 2·hmax on every side.
-    Vec3<double> iHalf{ iSize[0] + 2.0*hmax,
-                        iSize[1] + 2.0*hmax,
-                        iSize[2] + 2.0*hmax };
+    const double twoHi = 2.0 * hmax;
+    // Gather only: the i-leaf's box expanded by 2·hmax.  The symmetric radius depends
+    // on the candidate node, so that path cannot pre-inflate and leaves this unused.
+    Vec3<double> iHalf{ iSize[0] + twoHi,
+                        iSize[1] + twoHi,
+                        iSize[2] + twoHi };
 
     // DFS traversal.  The old bound (7 x tree_depth ~ 32) assumed a NARROW
     // search sphere; once hmax grows the sphere overlaps many subtrees and the
@@ -181,7 +246,7 @@ static __global__ void buildJLeafListKernel(
     int jBase    = iLeaf * MAX_J_PER_LEAF;
 
     // Check root overlap.
-    if (norm2(minDistance(iCenter, iHalf, centers[0], sizes[0])) > 0.0)
+    if (!nodeInRange<Symmetric>(iCenter, iSize, iHalf, twoHi, hmax_node, 0, centers, sizes))
     {
         jcount[iLeaf] = 0;
         return;
@@ -198,7 +263,8 @@ static __global__ void buildJLeafListKernel(
         for (int oct = 0; oct < 8; ++oct)
         {
             TreeNodeIndex child = childOffsets[node] + oct;
-            if (norm2(minDistance(iCenter, iHalf, centers[child], sizes[child])) > 0.0)
+            if (!nodeInRange<Symmetric>(iCenter, iSize, iHalf, twoHi, hmax_node, child,
+                                        centers, sizes))
                 continue;
             if (childOffsets[child] == 0)
             {

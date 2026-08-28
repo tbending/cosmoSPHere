@@ -2,7 +2,8 @@
  * density_base.cu — SPH density and gradient kernels, and the Newton solve.
  *
  * Physics only.  Everything about the octree — building it, deriving node geometry
- * and walking it for neighbour leaves — lives in tree.cuh / tree.cu.
+ * and walking it for neighbour leaves — lives in tree.cuh / tree.cu; the symmetric
+ * (force) walk lives in force.cu.
  *
  * Pipeline:
  *   1. Upload, then buildTree(): Hilbert keys, GPU sort, cornerstone leaf tree,
@@ -771,8 +772,8 @@ DensTimings solveDensH(// Host input/output
                 rawPtr(s.hmax_leaf));
             checkGpuErrors(cudaGetLastError());
 
-            buildJLeafListKernel<<<iceil(nActiveLeaves, 256), 256>>>(
-                rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf),
+            buildJLeafListKernel<false><<<iceil(nActiveLeaves, 256), 256>>>(
+                rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), nullptr,
                 rawPtr(s.centers), rawPtr(s.sizes),
                 rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
                 nActiveLeaves, rawPtr(d_activeLeaves),
@@ -891,8 +892,8 @@ DensTimings solveDensH(// Host input/output
             rawPtr(s.hmax_leaf));
         checkGpuErrors(cudaGetLastError());
 
-        buildJLeafListKernel<<<iceil(nActiveLeaves, 256), 256>>>(
-            rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf),
+        buildJLeafListKernel<false><<<iceil(nActiveLeaves, 256), 256>>>(
+            rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), nullptr,
             rawPtr(s.centers), rawPtr(s.sizes),
             rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
             nActiveLeaves, rawPtr(d_activeLeaves),
@@ -961,6 +962,11 @@ DensTimings solveDensH(// Host input/output
 
     for (auto* e : {&evUpload0, &evUpload1, &ev3, &evJB0, &evJB1, &ev4, &evDl0, &evDl1})
         HIP_CHECK(hipEventDestroy(*e));
+
+    // Hand the state to the force pass.  Bumping the token last means a solve that
+    // aborted part-way leaves the previous (already consumed) token in place, so
+    // force_gpu_c refuses rather than running on a half-built tree.
+    ++s.token;
 
     return t;
 }

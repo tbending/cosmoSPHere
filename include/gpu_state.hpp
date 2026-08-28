@@ -24,13 +24,11 @@
  * is worth ~3.7 ms and is the better next target.
  *
  * Single device, single state.  No multi-GPU, no concurrent solves.
- *
- * A second pass reading this must be sure a solve actually ran for the current
- * positions; nothing here enforces that yet.
  */
 
 #pragma once
 
+#include <cstdint>
 #include <thrust/device_vector.h>
 
 #include "sfc/box.hpp"
@@ -55,18 +53,30 @@ struct GpuState
     thrust::device_vector<unsigned> layout;      // leaf L owns particles [layout[L], layout[L+1])
     thrust::device_vector<int> particleLeaf;     // particle -> its leaf
 
-    // ---- per-leaf smoothing length ----
-    // Largest h in each leaf; the walk uses it to size the i-leaf's search radius.
-    thrust::device_vector<double> hmax_leaf;
+    // ---- smoothing length per leaf, and per node ----
+    // hmax_node is force-only: the gather walk only ever needs h for its own i-leaf.
+    thrust::device_vector<double> hmax_leaf, hmax_node;
 
     // ---- j-leaf lists ----
     // Fixed stride: leaf L occupies jlist[L*MAX_J_PER_LEAF ... +jcount[L]).
+    // Gather-only after the density solve; SYMMETRIC after buildForceJLeafList.
     thrust::device_vector<int> jlist, jcount;
     thrust::device_vector<int> overflow;         // [0] list truncations, [1] stack drops
 
     int ngas     = 0;
     int nLeaves  = 0;
     int numNodes = 0;
+
+    // Bumped by each completed density solve; 0 = none has run.  NOT consumed by
+    // force: deriv.f90:105-109 (icall=2) reuses the tree on purpose, so force runs
+    // more often than density.
+    uint64_t token = 0;
+
+    // The token jlist holds the SYMMETRIC list for.  Density overwrites jlist and
+    // bumps token, so a mismatch is exactly "needs rebuild" — nothing to invalidate.
+    uint64_t jlistToken = 0;
+
+    bool readyForForce(int n) const { return ngas == n && token != 0; }
 };
 
 //! @brief The one state shared by the density and force entry points (gpu_state.cu).
