@@ -38,4 +38,27 @@ struct ForceTimings
  * everywhere and a big-h leaf is also a big leaf.  Longest list seen: 433 against
  * MAX_J_PER_LEAF = 1024.
  */
+//make kernel visible to force_c_api.cu:
+__global__ void sphForceKernelJList(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const double* __restrict__ z,
+    const double* __restrict__ vx,
+    const double* __restrict__ vy,
+    const double* __restrict__ vz,
+    const double* __restrict__ h,
+    const double* __restrict__ rho,
+    const double* __restrict__ gradh,
+    const double* __restrict__ pro2,
+    double* __restrict__ fx,
+    double* __restrict__ fy,
+    double* __restrict__ fz,
+    double* __restrict__ f4,
+    int n,
+    double pmass,
+    const int* __restrict__ particleLeaf,
+    const int* __restrict__ jcount,
+    const int* __restrict__ jlist,
+    const unsigned* __restrict__ layout);
+
 void buildForceJLeafList(GpuState& s, ForceTimings& ft);
