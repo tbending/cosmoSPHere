@@ -35,10 +35,16 @@ extern "C" void force_gpu_c(
     int n,
     double pmass,
     const double* pro2,
+    const double* spsound,
+    const double* alphaAV,
+    const double* u,
+    double beta,
+    double alphau,
     double* fx,
     double* fy,
     double* fz,
-	double* f4)
+    double* f4,
+    double* vsigmax)
 {
     GpuState& s = gpuState();
 
@@ -62,19 +68,52 @@ extern "C" void force_gpu_c(
 
 	// Upload pro2 in PHANTOM order.
 	thrust::device_vector<double> d_pro2_phantom(pro2, pro2 + n);
+	thrust::device_vector<double> d_spsound_phantom(
+    spsound, spsound + n);
+
+	thrust::device_vector<double> d_alphaAV_phantom(
+	    alphaAV, alphaAV + n);
+	
+	thrust::device_vector<double> d_u_phantom(
+	    u, u + n);
 	
 	// Gather into the Hilbert order already stored in GpuState.
 	thrust::device_vector<double> d_pro2(n);
+	
+	thrust::device_vector<double> d_spsound(n);
+	thrust::device_vector<double> d_alphaAV(n);
+	thrust::device_vector<double> d_u(n);
+
 	thrust::gather(
 	    s.order.begin(),
 	    s.order.end(),
 	    d_pro2_phantom.begin(),
 	    d_pro2.begin());
+
+	thrust::gather(
+	    s.order.begin(),
+	    s.order.end(),
+	    d_spsound_phantom.begin(),
+	    d_spsound.begin());
 	
+	thrust::gather(
+	    s.order.begin(),
+	    s.order.end(),
+	    d_alphaAV_phantom.begin(),
+	    d_alphaAV.begin());
+	
+	thrust::gather(
+	    s.order.begin(),
+	    s.order.end(),
+	    d_u_phantom.begin(),
+	    d_u.begin());
+
+
 	thrust::device_vector<double> d_fx(n, 0.0);
 	thrust::device_vector<double> d_fy(n, 0.0);
 	thrust::device_vector<double> d_fz(n, 0.0);
 	thrust::device_vector<double> d_f4(n, 0.0);
+	thrust::device_vector<double> d_vsigmax(n, 0.0);
 	
 	constexpr int forceBlockSize = 256;
 	
@@ -88,11 +127,15 @@ extern "C" void force_gpu_c(
 	// >>> CALL THE FORCE KERNEL HERE <<<
 	sphForceKernelJList<<<iceil(n, forceBlockSize), forceBlockSize>>>(
 	    rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-	    rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),		
+	    rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
 	    rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh),
 	    rawPtr(d_pro2),
+	    rawPtr(d_spsound),
+	    rawPtr(d_alphaAV),
+	    rawPtr(d_u),
 	    rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
-	    n, pmass,
+	    rawPtr(d_vsigmax),
+	    n, pmass, beta, alphau,
 	    rawPtr(s.particleLeaf),
 	    rawPtr(s.jcount), rawPtr(s.jlist),
 	    rawPtr(s.layout));
@@ -134,6 +177,19 @@ extern "C" void force_gpu_c(
 	    f4, rawPtr(d_out),
 	    static_cast<size_t>(n) * sizeof(double),
 	    hipMemcpyDeviceToHost));
+
+	thrust::scatter(
+	    d_vsigmax.begin(),
+	    d_vsigmax.end(),
+	    s.order.begin(),
+	    d_out.begin());
+	
+	HIP_CHECK(hipMemcpy(
+	    vsigmax,
+	    rawPtr(d_out),
+	    static_cast<size_t>(n) * sizeof(double),
+	    hipMemcpyDeviceToHost));
+
 	//end scatter and download results
 
     //(void)pmass;   // until the kernel lands
