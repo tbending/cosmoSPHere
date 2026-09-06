@@ -9,28 +9,29 @@ __global__ void sphForceKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
     const double* __restrict__ z,
-
     const double* __restrict__ vx,
     const double* __restrict__ vy,
     const double* __restrict__ vz,
-
-    const double* __restrict__ h,           // in
-    const double* __restrict__ rho,         // in, this is the rho found from the density calculation earlier
-    const double* __restrict__ gradh,       // in, this is inputed after sphGradientsKernel computes it
-	const double* __restrict__ pro2,         // in, this is P/rho^2 computed by get_stress in force.f90 in PHANTOM
-    //int*          converged,   // in
-	double* __restrict__ fx,
+    const double* __restrict__ h,
+    const double* __restrict__ rho,
+    const double* __restrict__ gradh,
+    const double* __restrict__ pro2,
+    const double* __restrict__ spsound,
+    const double* __restrict__ alphaAV,
+    const double* __restrict__ u,
+    double* __restrict__ fx,
     double* __restrict__ fy,
-    double* __restrict__ fz,   
-	double* __restrict__ f4,   
-	int           n,        
-    //int           nActive,
-    //const int*    __restrict__ activeParticles,
-    double        pmass,
-    const int*       __restrict__ particleLeaf,
-    const int*       __restrict__ jcount,
-    const int*       __restrict__ jlist,
-    const unsigned*  __restrict__ layout)//force array
+    double* __restrict__ fz,
+    double* __restrict__ f4,
+    double* __restrict__ vsigmax,
+    int n,
+    double pmass,
+    double beta,
+    double alphau,
+    const int* __restrict__ particleLeaf,
+    const int* __restrict__ jcount,
+    const int* __restrict__ jlist,
+    const unsigned* __restrict__ layout)
 {
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) return;    
@@ -49,12 +50,18 @@ __global__ void sphForceKernelJList(
 	const double omega_inv_i = 1 / omegai;
 	
 	const double pro2i = pro2[i];
+	const double vwavei = spsound[i];
+	const double alphai = alphaAV[i];
+	const double eni = u[i];
+	const double rho1i  = 1.0 / rhoi;
+	const double pri    = pro2i * rhoi * rhoi;
+	const double autermi = 0.5 * pmass * rho1i * alphau;
 	//const double rho_i = rho[i]
     //const double dhdrhoi = -hi / (3.0 * rho_i);
 	//const double grad_i = grad_h[i]
     //double rhoi  = 0.0;
     //double gradhi = 0.0;
-
+	
 	double itermx = 0.0; //this corresponds to the 1st term in the force summation that includes neighbours within hi
 	double itermy = 0.0;
 	double itermz = 0.0;
@@ -63,6 +70,7 @@ __global__ void sphForceKernelJList(
 	double jtermz = 0.0;
 
 	double f4sum = 0.0; //internal energy derivative
+	double vsigmax_i = 0.0;
 
     const int iLeaf = particleLeaf[i];
     const int jBase = iLeaf * MAX_J_PER_LEAF;
@@ -93,57 +101,135 @@ __global__ void sphForceKernelJList(
 			double runix = dx / dr; //this is the x-component of rij^hat := (ri - rj) / abs(rij)
 			double runiy = dy / dr; //same as above, but y-component
 			double runiz = dz / dr; //same as above, but z-component
+			const double dvxij = vx[i] - vx[j]; 
+			const double dvyij = vy[i] - vy[j];
+			const double dvzij = vz[i] - vz[j];
+			const double projv = dvxij * runix + dvyij * runiy + dvzij * runiz;
+
+			const double rhoj    = rho[j];
+			const double rho1j   = 1.0 / rhoj;
+			const double pro2j   = pro2[j];
+			const double vwavej  = spsound[j];
+			const double alphaj  = alphaAV[j];
+			const double enj     = u[j];
+			
+			const double prj     = pro2j * rhoj * rhoj;
+			const double autermj = 0.5 * pmass * rho1j * alphau;
+			
+ 			//const double vsigi = fmax(vwavei - beta * projv, 0.0);//this is for time-stepping with alpha taken to be 1
+	
+			//const double vsigavi =
+			    //fmax(alphai * vwavei - beta * projv, 0.0);//this is for the qro in force terms
+		
+			//const double vwavej = spsound[j];
+			//const double alphaj = alphaAV[j];
+//vsig parameters
+			const double vsigi =
+			    fmax(vwavei - beta * projv, 0.0);
+			
+			const double vsigavi =
+			    fmax(alphai * vwavei - beta * projv, 0.0);
+			
+			const double vsigj =
+			    fmax(vwavej - beta * projv, 0.0);
+			
+			const double vsigavj =
+			    fmax(alphaj * vwavej - beta * projv, 0.0);
+			
+			const double pair_vsigmax =
+			    fmax(vsigi, vsigj);
+
+			vsigmax_i = fmax(vsigmax_i, vsigi);
+
+
+			double qrho2i = 0.0;
+			double qrho2j = 0.0;
+			
+			const double denij  = eni - enj;
+			const double rhoav1 = 2.0 / (rhoi + rhoj);
+			const double vsigu  = sqrt(fabs(pri - prj) * rhoav1);
+
+			if (projv < 0.0)
+			{
+			    qrho2i = -0.5 * rho1i * vsigavi * projv;
+			    qrho2j = -0.5 * rho1j * vsigavj * projv;
+			}	
+
 
             if (qij2 < sph::radk2)
             {
+
+				vsigmax_i = fmax(vsigmax_i, pair_vsigmax);
+
                 double qij, wij, grwij;
                 qij = sqrt(qij2);
                 sph::m4_kern(qij, wij, grwij);
 
-				double hfacgrkerni = hi_4_inv * sph::cnormk * omega_inv_i;//mirrors the Fortran definition of hfacgrkern
-				double gradkerni = grwij * hfacgrkerni; //this is now (1/omega) * Fij(hi) as in the Fortran definition as well
-				itermx += -pmass * pro2i * gradkerni * runix; //updating components of the 1st term in the force summation: 
-				itermy += -pmass * pro2i * gradkerni * runiy;
-				itermz += -pmass * pro2i * gradkerni * runiz;
+				const double hfacgrkerni = hi_4_inv * sph::cnormk * omega_inv_i;//mirrors the Fortran definition of hfacgrkern
+				const double gradkerni = grwij * hfacgrkerni; //this is now (1/omega) * Fij(hi) as in the Fortran definition as well
+				
+				const double gradpi =
+				    pmass * (pro2i + qrho2i) * gradkerni;
+
+   				itermx += -gradpi * runix; //updating components of the 1st term in the force summation: 
+				itermy += -gradpi * runiy;
+				itermz += -gradpi * runiz;
 				//double hfacgrkernj = hj
                 //rhoi  += wij;
                 //gradhi += -qij * grwij - 3.0 * wij;
 
 				//calculate internal energy derivative
 
-				const double dvxij = vx[i] - vx[j]; 
-				const double dvyij = vy[i] - vy[j];
-				const double dvzij = vz[i] - vz[j];
+				//this is now pdv term to mirror the original Fortran code
 
-				const double vproji = dvxij * runix + dvyij * runiy + dvzij * runiz;
- 
-				f4sum += pmass * pro2i * vproji * gradkerni;
+				const double pdvtermi =
+				    pmass * pro2i * projv * gradkerni;
+				
+				const double dudtdissi =
+				    pmass * qrho2i * projv * gradkerni; //qrho2i does not appear in the paper directly but 
+				
+				const double dendisstermi =
+				    vsigu * denij * autermi * gradkerni;
+
+
+				f4sum += pdvtermi;
+				f4sum += dudtdissi;
+				f4sum += dendisstermi;
 
             }
 
 			if (qj_ij2 < sph::radk2)
 
 			{
-											
+							
+				vsigmax_i = fmax(vsigmax_i, pair_vsigmax);
+				
 				double qj_ij, wj_ij, grwj_ij;
             	qj_ij = sqrt(qj_ij2);//might need to be changed to qj_ij2
             	sph::m4_kern(qj_ij, wj_ij, grwj_ij);
 							
-				const double pro2j = pro2[j];
+				// double pro2j = pro2[j];
 												//fij = sph::cnormk * hi_4_inv * grwij
-				const double rhoj = rho[j];
+				//const double rhoj = rho[j];
 			    const double dhdrhoj = -hj / (3.0 * rhoj);
 				const double grad_j = gradh[j];
 		    	const double omegaj  = 1.0 - dhdrhoj * grad_j; //this is the actual omega used for force as well
 				const double omega_inv_j = 1 / omegaj;
 												
 				double hfacgrkernj = hj_4_inv * sph::cnormk * omega_inv_j;//mirrors the Fortran definition of hfacgrkern
-				double gradkernj = grwj_ij * hfacgrkernj; //this is now (1/omega) * Fij(hi) as in the Fortran definition as well
-				jtermx += -pmass * pro2j * gradkernj * runix; //updating components of the 1st term in the force summation: 
-				jtermy += -pmass * pro2j * gradkernj * runiy;
-				jtermz += -pmass * pro2j * gradkernj * runiz;
-											
-											
+				double gradkernj = grwj_ij * hfacgrkernj; //this is now (1/omega) * Fij(hi) as in the Fortran definition as wel
+
+				const double gradpj =
+				    pmass * (pro2j + qrho2j) * gradkernj;
+
+				jtermx -= gradpj * runix;
+				jtermy -= gradpj * runiy;
+				jtermz -= gradpj * runiz;
+										
+				const double dendisstermj =
+				    vsigu * denij * autermj * gradkernj;
+				
+				f4sum += dendisstermj;					
 			}//end non-SPH neighbour
 
         }//end j-loop
@@ -166,6 +252,7 @@ __global__ void sphForceKernelJList(
         fy[i]     = 0.0;
         fz[i] = 0;
 		f4[i] = 0;
+		vsigmax[i] = 0.0;
         return;
     }
 	
@@ -175,6 +262,7 @@ __global__ void sphForceKernelJList(
 	fy[i] = itermy + jtermy;
 	fz[i] = itermz + jtermz;	
 	f4[i] = f4sum;
+	vsigmax[i] = vsigmax_i;
     // dhdrho uses rhoh(h)=pmass*(hfact/h)^3, matching the CPU (part.F90 dhdrho),
     // NOT the SPH sum rho_i.  See sphDensityKernel for the rationale.
 
