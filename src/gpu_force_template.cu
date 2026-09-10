@@ -24,6 +24,7 @@ __global__ void sphForceKernelJList(
     double* __restrict__ fz,
     double* __restrict__ f4,
     double* __restrict__ vsigmax,
+    double* __restrict__ divv,
     int n,
     double pmass,
     double beta,
@@ -71,6 +72,7 @@ __global__ void sphForceKernelJList(
 
 	double f4sum = 0.0; //internal energy derivative
 	double vsigmax_i = 0.0;
+    double divv_s = 0.0;
 
     const int iLeaf = particleLeaf[i];
     const int jBase = iLeaf * MAX_J_PER_LEAF;
@@ -165,6 +167,22 @@ __global__ void sphForceKernelJList(
                 qij = sqrt(qij2);
                 sph::m4_kern(qij, wij, grwij);
 
+
+
+				//mirroring sphGradientsKernel
+                const double rij1_divv = 1.0 / (dr + 2.220446049250313e-16);
+                const double rij1grkern_divv = rij1_divv * grwij;
+
+                const double runix_divv = dx * rij1grkern_divv * pmass;
+                const double runiy_divv = dy * rij1grkern_divv * pmass;
+                const double runiz_divv = dz * rij1grkern_divv * pmass;
+
+                divv_s += dvxij * runix_divv
+                        + dvyij * runiy_divv
+                        + dvzij * runiz_divv;
+
+
+
 				const double hfacgrkerni = hi_4_inv * sph::cnormk * omega_inv_i;//mirrors the Fortran definition of hfacgrkern
 				const double gradkerni = grwij * hfacgrkerni; //this is now (1/omega) * Fij(hi) as in the Fortran definition as well
 				
@@ -253,6 +271,7 @@ __global__ void sphForceKernelJList(
         fz[i] = 0;
 		f4[i] = 0;
 		vsigmax[i] = 0.0;
+        divv[i] = 0.0;
         return;
     }
 	
@@ -263,6 +282,11 @@ __global__ void sphForceKernelJList(
 	fz[i] = itermz + jtermz;	
 	f4[i] = f4sum;
 	vsigmax[i] = vsigmax_i;
+
+    const double omega_inv_divv = (omegai > 0.0) ? (1.0 / omegai) : 1.0;
+    const double term_divv = sph::cnormk * omega_inv_divv * hi_4_inv / rhoi;
+
+    divv[i] = -divv_s * term_divv;
     // dhdrho uses rhoh(h)=pmass*(hfact/h)^3, matching the CPU (part.F90 dhdrho),
     // NOT the SPH sum rho_i.  See sphDensityKernel for the rationale.
 

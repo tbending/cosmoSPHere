@@ -31,9 +31,17 @@
 // Output arrays are deliberately absent: this currently builds the symmetric j-leaf
 // list and nothing else, so there is nothing to write back yet.  fx/fy/fz/dudt get
 // added to the signature together with the force kernel.
+
 extern "C" void force_gpu_c(
     int n,
     double pmass,
+    const double* x,
+    const double* y,
+    const double* z,
+    const double* h,
+    const double* vx,
+    const double* vy,
+    const double* vz,
     const double* pro2,
     const double* spsound,
     const double* alphaAV,
@@ -44,7 +52,8 @@ extern "C" void force_gpu_c(
     double* fy,
     double* fz,
     double* f4,
-    double* vsigmax)
+    double* vsigmax,
+    double* divv)
 {
     GpuState& s = gpuState();
 
@@ -108,13 +117,33 @@ extern "C" void force_gpu_c(
 	    d_u_phantom.begin(),
 	    d_u.begin());
 
+	//gather CPU-uploaded arrays
+    thrust::device_vector<double> d_x_phantom(x, x + n);
+    thrust::device_vector<double> d_y_phantom(y, y + n);
+    thrust::device_vector<double> d_z_phantom(z, z + n);
+    thrust::device_vector<double> d_h_phantom(h, h + n);
+    thrust::device_vector<double> d_vx_phantom(vx, vx + n);
+    thrust::device_vector<double> d_vy_phantom(vy, vy + n);
+    thrust::device_vector<double> d_vz_phantom(vz, vz + n);
+
+    thrust::device_vector<double> d_x(n), d_y(n), d_z(n), d_h(n);
+    thrust::device_vector<double> d_vx(n), d_vy(n), d_vz(n);
+
+    thrust::gather(s.order.begin(), s.order.end(), d_x_phantom.begin(), d_x.begin());
+    thrust::gather(s.order.begin(), s.order.end(), d_y_phantom.begin(), d_y.begin());
+    thrust::gather(s.order.begin(), s.order.end(), d_z_phantom.begin(), d_z.begin());
+    thrust::gather(s.order.begin(), s.order.end(), d_h_phantom.begin(), d_h.begin());
+    thrust::gather(s.order.begin(), s.order.end(), d_vx_phantom.begin(), d_vx.begin());
+    thrust::gather(s.order.begin(), s.order.end(), d_vy_phantom.begin(), d_vy.begin());
+    thrust::gather(s.order.begin(), s.order.end(), d_vz_phantom.begin(), d_vz.begin());
 
 	thrust::device_vector<double> d_fx(n, 0.0);
 	thrust::device_vector<double> d_fy(n, 0.0);
 	thrust::device_vector<double> d_fz(n, 0.0);
 	thrust::device_vector<double> d_f4(n, 0.0);
 	thrust::device_vector<double> d_vsigmax(n, 0.0);
-	
+	thrust::device_vector<double> d_divv(n, 0.0);
+
 	constexpr int forceBlockSize = 256;
 	
 
@@ -125,21 +154,21 @@ extern "C" void force_gpu_c(
 
 	// =======================================================================
 	// >>> CALL THE FORCE KERNEL HERE <<<
-	sphForceKernelJList<<<iceil(n, forceBlockSize), forceBlockSize>>>(
-	    rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-	    rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
-	    rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh),
-	    rawPtr(d_pro2),
-	    rawPtr(d_spsound),
-	    rawPtr(d_alphaAV),
-	    rawPtr(d_u),
-	    rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
-	    rawPtr(d_vsigmax),
-	    n, pmass, beta, alphau,
-	    rawPtr(s.particleLeaf),
-	    rawPtr(s.jcount), rawPtr(s.jlist),
-	    rawPtr(s.layout));
-    // =======================================================================
+    sphForceKernelJList<<<iceil(n, forceBlockSize), forceBlockSize>>>(
+        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
+        rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
+        rawPtr(d_h), rawPtr(s.rho), rawPtr(s.gradh),
+        rawPtr(d_pro2),
+        rawPtr(d_spsound),
+        rawPtr(d_alphaAV),
+        rawPtr(d_u),
+        rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
+        rawPtr(d_vsigmax), rawPtr(d_divv),
+        n, pmass, beta, alphau,
+        rawPtr(s.particleLeaf),
+        rawPtr(s.jcount), rawPtr(s.jlist),
+        rawPtr(s.layout));
+   // =======================================================================
 	checkGpuErrors(cudaGetLastError());
 	HIP_CHECK(hipDeviceSynchronize()); //check errors
     //scatter and download results:
@@ -190,6 +219,14 @@ extern "C" void force_gpu_c(
 	    static_cast<size_t>(n) * sizeof(double),
 	    hipMemcpyDeviceToHost));
 
+    thrust::scatter(
+        d_divv.begin(), d_divv.end(),
+        s.order.begin(), d_out.begin());
+
+    HIP_CHECK(hipMemcpy(
+        divv, rawPtr(d_out),
+        static_cast<size_t>(n) * sizeof(double),
+        hipMemcpyDeviceToHost));
 	//end scatter and download results
 
     //(void)pmass;   // until the kernel lands

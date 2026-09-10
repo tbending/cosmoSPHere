@@ -58,6 +58,7 @@ __global__ void sphForceKernelJList(
     double* __restrict__ fz,
     double* __restrict__ f4,
     double* __restrict__ vsigmax,
+    double* __restrict__ divv,
     int n,
     double pmass,
     double beta,
