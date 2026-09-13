@@ -13,7 +13,7 @@ __global__ void sphForceKernelJList(
     const double* __restrict__ vy,
     const double* __restrict__ vz,
     const double* __restrict__ h,
-    const double* __restrict__ rho,
+    //const double* __restrict__ rho,
     const double* __restrict__ gradh,
     const double* __restrict__ pro2,
     const double* __restrict__ spsound,
@@ -43,7 +43,9 @@ __global__ void sphForceKernelJList(
     const double hi_sq_inv = 1.0 / (hi * hi);
 	const double hi_4_inv = hi_sq_inv * hi_sq_inv;
 
-	const double rhoi = rho[i];
+	const double hfoh_i = sph::hfact / hi;
+	const double rhoi = pmass * hfoh_i * hfoh_i * hfoh_i;   // rhoh(hi), to mirror phantom
+
 	const double grad_i = gradh[i];//partial rho partial h at constant qij, already evaluated in the density loop
     const double dhdrhoi = -hi / (3.0 * rhoi);
     //const double grad_i  = gradhi * sph::cnormk * pmass * hi41; //= Sum[(-qij*f'(qij) - 3 * f(qij)) * Cnorm * m * 1/hi^4, j] = partial rhoi partial hi (while keeping q fixed), this is no longer needed bc of above
@@ -108,7 +110,9 @@ __global__ void sphForceKernelJList(
 			const double dvzij = vz[i] - vz[j];
 			const double projv = dvxij * runix + dvyij * runiy + dvzij * runiz;
 
-			const double rhoj    = rho[j];
+			const double hfoh_j = sph::hfact / hj;
+			const double rhoj = pmass * hfoh_j * hfoh_j * hfoh_j;   // rhoh(hj), to mirror phantom, so that rho as an array does not need to be copied to the GPU
+
 			const double rho1j   = 1.0 / rhoj;
 			const double pro2j   = pro2[j];
 			const double vwavej  = spsound[j];
@@ -141,7 +145,7 @@ __global__ void sphForceKernelJList(
 			const double pair_vsigmax =
 			    fmax(vsigi, vsigj);
 
-			vsigmax_i = fmax(vsigmax_i, vsigi);
+			//vsigmax_i = fmax(vsigmax_i, vsigi);
 
 
 			double qrho2i = 0.0;

@@ -157,7 +157,7 @@ extern "C" void force_gpu_c(
     sphForceKernelJList<<<iceil(n, forceBlockSize), forceBlockSize>>>(
         rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
         rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
-        rawPtr(d_h), rawPtr(s.rho), rawPtr(s.gradh),
+        rawPtr(d_h), rawPtr(s.gradh),
         rawPtr(d_pro2),
         rawPtr(d_spsound),
         rawPtr(d_alphaAV),
