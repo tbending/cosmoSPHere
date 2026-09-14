@@ -38,7 +38,14 @@ struct ForceTimings
  * everywhere and a big-h leaf is also a big leaf.  Longest list seen: 433 against
  * MAX_J_PER_LEAF = 1024.
  */
-//make kernel visible to force_c_api.cu:
+void buildForceJLeafList(GpuState& s, ForceTimings& ft);
+
+/*! @brief SPH force on one particle per thread, over the symmetric j-leaf list.
+ *
+ * Threads index Hilbert-sorted particles.  Returns the pressure and artificial
+ * viscosity force (fx, fy, fz), du/dt (f4), vsigmax for the Courant timestep and
+ * div v.  Defined in force.cu.
+ */
 __global__ void sphForceKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -66,5 +73,3 @@ __global__ void sphForceKernelJList(
     const int* __restrict__ jcount,
     const int* __restrict__ jlist,
     const unsigned* __restrict__ layout);
-
-void buildForceJLeafList(GpuState& s, ForceTimings& ft);
