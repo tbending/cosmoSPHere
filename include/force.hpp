@@ -47,7 +47,6 @@ __global__ void sphForceKernelJList(
     const double* __restrict__ vy,
     const double* __restrict__ vz,
     const double* __restrict__ h,
-    //const double* __restrict__ rho,
     const double* __restrict__ gradh,
     const double* __restrict__ pro2,
     const double* __restrict__ spsound,
