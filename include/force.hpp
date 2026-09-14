@@ -19,6 +19,9 @@ struct ForceTimings
 {
     double hmaxUpsweep = 0.0;
     double jleafBuild  = 0.0;
+    double upload      = 0.0;   // host -> device copies and gathers into Hilbert order
+    double kernel      = 0.0;   // sphForceKernelJList
+    double download    = 0.0;   // scatters back to phantom order and device -> host copies
 };
 
 // Host arrays for one force pass, in phantom order, all length n.  Raw pointers rather

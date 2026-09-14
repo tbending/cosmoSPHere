@@ -30,10 +30,13 @@
  */
 
 #include "density.hpp"
+#include "gpu_check.hpp"
+#include "util/cuda_utils.hpp"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 extern "C" void densityiterate_gpu_c(
@@ -83,6 +86,28 @@ extern "C" void densityiterate_gpu_c(
         gradh_out[i] = gradh_vec[i];
     }
     auto t3 = clk::now();
+
+    // COSMO_MEM: one line per run with device memory in use and the host high-water
+    // mark, taken after the first solve, so the largest problem that fits on a given
+    // card can be extrapolated from a small run.
+    static bool memReported = false;
+    if (!memReported && std::getenv("COSMO_MEM"))
+    {
+        memReported = true;
+        size_t freeB = 0, totalB = 0;
+        HIP_CHECK(hipMemGetInfo(&freeB, &totalB));
+        long hwmKB = 0;
+        if (FILE* fp = std::fopen("/proc/self/status", "r"))
+        {
+            char line[256];
+            while (std::fgets(line, sizeof line, fp))
+                if (std::strncmp(line, "VmHWM:", 6) == 0) { std::sscanf(line + 6, "%ld", &hwmKB); break; }
+            std::fclose(fp);
+        }
+        std::fprintf(stderr,
+            "COSMO_MEM n=%d device_used=%.2f GB of %.2f GB (%.0f bytes/particle) host_peak=%.2f GB\n",
+            n, (totalB - freeB) / 1e9, totalB / 1e9, double(totalB - freeB) / n, hwmKB / 1e6);
+    }
 
     if (stats) {
         auto ms = [](clk::time_point a, clk::time_point b) {

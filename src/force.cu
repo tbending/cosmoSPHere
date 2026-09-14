@@ -321,6 +321,12 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
 
     buildForceJLeafList(s, ft);
 
+    // Phase boundaries on the device timeline, like buildForceJLeafList: recording
+    // an event does not synchronise, so timing does not perturb what it measures.
+    cudaEvent_t e0, e1, e2, e3;
+    for (auto* e : {&e0, &e1, &e2, &e3}) checkGpuErrors(hipEventCreate(e));
+    HIP_CHECK(hipEventRecord(e0));
+
     // phantom order -> Hilbert order (s.order maps sorted index -> phantom index)
     auto upload = [&](const double* host)
     {
@@ -339,6 +345,7 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
 
     thrust::device_vector<double> d_fx(n, 0.0), d_fy(n, 0.0), d_fz(n, 0.0), d_f4(n, 0.0);
     thrust::device_vector<double> d_vsigmax(n, 0.0), d_divv(n, 0.0);
+    HIP_CHECK(hipEventRecord(e1));
 
     sphForceKernelJList<<<iceil(n, 256), 256>>>(
         rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
@@ -350,6 +357,7 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
         n, pmass, beta, alphau,
         rawPtr(s.particleLeaf), rawPtr(s.jcount), rawPtr(s.jlist), rawPtr(s.layout));
     checkGpuErrors(cudaGetLastError());
+    HIP_CHECK(hipEventRecord(e2));
     HIP_CHECK(hipDeviceSynchronize());
 
     // Hilbert order -> phantom order, then to the host
@@ -366,4 +374,12 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     download(d_f4, f.f4);
     download(d_vsigmax, f.vsigmax);
     download(d_divv, f.divv);
+
+    HIP_CHECK(hipEventRecord(e3));
+    checkGpuErrors(hipEventSynchronize(e3));
+    float ms = 0;
+    HIP_CHECK(hipEventElapsedTime(&ms, e0, e1)); ft.upload   = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, e1, e2)); ft.kernel   = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, e2, e3)); ft.download = ms * 1e-3;
+    for (auto* e : {&e0, &e1, &e2, &e3}) HIP_CHECK(hipEventDestroy(*e));
 }

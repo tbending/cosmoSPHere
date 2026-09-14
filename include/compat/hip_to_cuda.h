@@ -27,6 +27,7 @@ typedef cudaEvent_t  hipEvent_t;
 
 /* --- Device management --- */
 #define hipDeviceSynchronize    cudaDeviceSynchronize
+#define hipMemGetInfo           cudaMemGetInfo
 #define hipSetDevice            cudaSetDevice
 
 /* --- Events (timing) --- */
