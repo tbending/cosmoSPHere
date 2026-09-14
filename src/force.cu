@@ -132,8 +132,21 @@ __global__ void sphForceKernelJList(
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) return;
 
+    const double hi = h[i];
+
+    // Dead particles (h <= 0): no force, and skip the neighbour loop.
+    if (!(hi > 0.0))
+    {
+        fx[i]      = 0.0;
+        fy[i]      = 0.0;
+        fz[i]      = 0.0;
+        f4[i]      = 0.0;
+        vsigmax[i] = 0.0;
+        divv[i]    = 0.0;
+        return;
+    }
+
     const double xi = x[i], yi = y[i], zi = z[i];
-    const double hi        = h[i];
     const double hi_sq_inv = 1.0 / (hi * hi);
     const double hi_4_inv  = hi_sq_inv * hi_sq_inv;
 
@@ -145,6 +158,7 @@ __global__ void sphForceKernelJList(
     const double dhdrhoi     = -hi / (3.0 * rhoi);
     const double omegai      = 1.0 - dhdrhoi * grad_i;
     const double omega_inv_i = 1 / omegai;
+    const double hfacgrkerni = hi_4_inv * sph::cnormk * omega_inv_i;   // hfacgrkern in force.F90
 
     const double pro2i   = pro2[i];
     const double vwavei  = spsound[i];
@@ -179,13 +193,13 @@ __global__ void sphForceKernelJList(
             double dz  = zi - z[j];
             double dr2 = dx*dx + dy*dy + dz*dz;
             if (!(dr2 > 0.0)) continue;
-            double qij2 = (dx*dx + dy*dy + dz*dz) * hi_sq_inv;
+            double qij2 = dr2 * hi_sq_inv;
 
             const double hj        = h[j];
             const double hj_sq_inv = 1.0 / (hj * hj);
             const double hj_4_inv  = hj_sq_inv * hj_sq_inv;
 
-            double qj_ij2 = (dx*dx + dy*dy + dz*dz) * hj_sq_inv;
+            double qj_ij2 = dr2 * hj_sq_inv;
 
             double dr    = sqrt(dr2);
             double runix = dx / dr;   // unit vector (r_i - r_j) / |r_i - r_j|
@@ -251,8 +265,7 @@ __global__ void sphForceKernelJList(
                         + dvyij * runiy_divv
                         + dvzij * runiz_divv;
 
-                const double hfacgrkerni = hi_4_inv * sph::cnormk * omega_inv_i;   // hfacgrkern in force.F90
-                const double gradkerni   = grwij * hfacgrkerni;                    // F_ij(h_i) / omega_i
+                const double gradkerni = grwij * hfacgrkerni;   // F_ij(h_i) / omega_i
 
                 const double gradpi = pmass * (pro2i + qrho2i) * gradkerni;
 
@@ -299,26 +312,13 @@ __global__ void sphForceKernelJList(
         }
     }
 
-    // Dead particles (h <= 0) have rhoi <= 0: return zeros for them.
-    if (!(rhoi > 0.0))
-    {
-        fx[i]      = 0.0;
-        fy[i]      = 0.0;
-        fz[i]      = 0;
-        f4[i]      = 0;
-        vsigmax[i] = 0.0;
-        divv[i]    = 0.0;
-        return;
-    }
-
     fx[i]      = itermx + jtermx;
     fy[i]      = itermy + jtermy;
     fz[i]      = itermz + jtermz;
     f4[i]      = f4sum;
     vsigmax[i] = vsigmax_i;
 
-    const double omega_inv_divv = (omegai > 0.0) ? (1.0 / omegai) : 1.0;
-    const double term_divv      = sph::cnormk * omega_inv_divv * hi_4_inv / rhoi;
+    const double term_divv = sph::cnormk * omega_inv_i * hi_4_inv / rhoi;
 
     divv[i] = -divv_s * term_divv;
 }
