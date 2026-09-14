@@ -253,17 +253,8 @@ __global__ void sphForceKernelJList(
                 qij = sqrt(qij2);
                 sph::m4_kern(qij, wij, grwij);
 
-                // div v, as in sphGradientsKernel
-                const double rij1_divv       = 1.0 / (dr + 2.220446049250313e-16);
-                const double rij1grkern_divv = rij1_divv * grwij;
-
-                const double runix_divv = dx * rij1grkern_divv * pmass;
-                const double runiy_divv = dy * rij1grkern_divv * pmass;
-                const double runiz_divv = dz * rij1grkern_divv * pmass;
-
-                divv_s += dvxij * runix_divv
-                        + dvyij * runiy_divv
-                        + dvzij * runiz_divv;
+                // div v: projv is already (v_i - v_j) . r_ij / |r_ij|
+                divv_s += pmass * grwij * projv;
 
                 const double gradkerni = grwij * hfacgrkerni;   // F_ij(h_i) / omega_i
 
