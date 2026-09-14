@@ -2,9 +2,11 @@
  * force.hpp — GPU force pass.
  *
  * Phantom runs density and force as two passes (deriv.F90 :139 and :195), so this is
- * a separate entry point rather than a tail on the density solve.  It reuses the tree
- * and the sorted particles left in GpuState by solveDensH; rebuilding them here would
- * cost ~10.8 ms of a 33.7 ms solve, every step, for nothing.
+ * a separate entry point rather than a tail on the density solve.  It reuses the tree,
+ * the Hilbert ordering and gradh left in GpuState by solveDensH; rebuilding them here
+ * would cost ~10.8 ms of a 33.7 ms solve, every step, for nothing.  Positions, h and
+ * velocities are passed in again, because phantom calls force a second time after the
+ * particles have moved (the leapfrog corrector, icall=2).
  */
 
 #pragma once
@@ -17,6 +19,23 @@ struct ForceTimings
 {
     double hmaxUpsweep = 0.0;
     double jleafBuild  = 0.0;
+};
+
+// Host arrays for one force pass, in phantom order, all length n.  Raw pointers rather
+// than std::vector, as for GradFields: they come straight from Fortran through the C API.
+struct ForceFields
+{
+    // inputs
+    const double* x;  const double* y;  const double* z;  const double* h;
+    const double* vx; const double* vy; const double* vz;
+    const double* pro2;      // P / rho^2
+    const double* spsound;   // sound speed
+    const double* alphaAV;   // artificial viscosity alpha
+    const double* u;         // specific thermal energy
+    // outputs
+    double* fx; double* fy; double* fz; double* f4;   // fxyzu(1:4)
+    double* vsigmax;         // max signal speed over neighbours, for the Courant timestep
+    double* divv;            // div v
 };
 
 /*! @brief Rebuild the j-leaf lists with the SYMMETRIC (gather + scatter) criterion.
@@ -40,36 +59,13 @@ struct ForceTimings
  */
 void buildForceJLeafList(GpuState& s, ForceTimings& ft);
 
-/*! @brief SPH force on one particle per thread, over the symmetric j-leaf list.
+
+/*! @brief SPH forces for every particle.
  *
- * Threads index Hilbert-sorted particles.  Returns the pressure and artificial
- * viscosity force (fx, fy, fz), du/dt (f4), vsigmax for the Courant timestep and
- * div v.  Defined in force.cu.
+ * Rebuilds the symmetric j-leaf lists if the tree has changed, uploads the inputs and
+ * gathers them into Hilbert order, runs the force kernel, and scatters the outputs back
+ * to phantom order.  Requires a density solve for the same particle set
+ * (GpuState::readyForForce).
  */
-__global__ void sphForceKernelJList(
-    const double* __restrict__ x,
-    const double* __restrict__ y,
-    const double* __restrict__ z,
-    const double* __restrict__ vx,
-    const double* __restrict__ vy,
-    const double* __restrict__ vz,
-    const double* __restrict__ h,
-    const double* __restrict__ gradh,
-    const double* __restrict__ pro2,
-    const double* __restrict__ spsound,
-    const double* __restrict__ alphaAV,
-    const double* __restrict__ u,
-    double* __restrict__ fx,
-    double* __restrict__ fy,
-    double* __restrict__ fz,
-    double* __restrict__ f4,
-    double* __restrict__ vsigmax,
-    double* __restrict__ divv,
-    int n,
-    double pmass,
-    double beta,
-    double alphau,
-    const int* __restrict__ particleLeaf,
-    const int* __restrict__ jcount,
-    const int* __restrict__ jlist,
-    const unsigned* __restrict__ layout);
+void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
+                   double alphau, ForceTimings& ft);

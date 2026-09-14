@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <vector>
 
+#include <thrust/device_vector.h>
+#include <thrust/gather.h>
+#include <thrust/scatter.h>
 #include <thrust/sequence.h>
 
 void buildForceJLeafList(GpuState& s, ForceTimings& ft)
@@ -96,6 +99,8 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
             ovf[0], ovf[1]);
 }
 
+// SPH force on one particle per thread, over the symmetric j-leaf list.  Threads index
+// Hilbert-sorted particles.
 __global__ void sphForceKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -316,4 +321,58 @@ __global__ void sphForceKernelJList(
     const double term_divv      = sph::cnormk * omega_inv_divv * hi_4_inv / rhoi;
 
     divv[i] = -divv_s * term_divv;
+}
+
+void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
+                   double alphau, ForceTimings& ft)
+{
+    const int n = s.ngas;
+
+    buildForceJLeafList(s, ft);
+
+    // phantom order -> Hilbert order (s.order maps sorted index -> phantom index)
+    auto upload = [&](const double* host)
+    {
+        thrust::device_vector<double> phantomOrder(host, host + n);
+        thrust::device_vector<double> sorted(n);
+        thrust::gather(s.order.begin(), s.order.end(), phantomOrder.begin(), sorted.begin());
+        return sorted;
+    };
+    thrust::device_vector<double> d_x  = upload(f.x),  d_y  = upload(f.y),  d_z  = upload(f.z);
+    thrust::device_vector<double> d_h  = upload(f.h);
+    thrust::device_vector<double> d_vx = upload(f.vx), d_vy = upload(f.vy), d_vz = upload(f.vz);
+    thrust::device_vector<double> d_pro2    = upload(f.pro2);
+    thrust::device_vector<double> d_spsound = upload(f.spsound);
+    thrust::device_vector<double> d_alphaAV = upload(f.alphaAV);
+    thrust::device_vector<double> d_u       = upload(f.u);
+
+    thrust::device_vector<double> d_fx(n, 0.0), d_fy(n, 0.0), d_fz(n, 0.0), d_f4(n, 0.0);
+    thrust::device_vector<double> d_vsigmax(n, 0.0), d_divv(n, 0.0);
+
+    sphForceKernelJList<<<iceil(n, 256), 256>>>(
+        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
+        rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
+        rawPtr(d_h), rawPtr(s.gradh),
+        rawPtr(d_pro2), rawPtr(d_spsound), rawPtr(d_alphaAV), rawPtr(d_u),
+        rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
+        rawPtr(d_vsigmax), rawPtr(d_divv),
+        n, pmass, beta, alphau,
+        rawPtr(s.particleLeaf), rawPtr(s.jcount), rawPtr(s.jlist), rawPtr(s.layout));
+    checkGpuErrors(cudaGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+
+    // Hilbert order -> phantom order, then to the host
+    thrust::device_vector<double> d_out(n);
+    auto download = [&](const thrust::device_vector<double>& sorted, double* host)
+    {
+        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), d_out.begin());
+        HIP_CHECK(hipMemcpy(host, rawPtr(d_out), static_cast<size_t>(n) * sizeof(double),
+                            hipMemcpyDeviceToHost));
+    };
+    download(d_fx, f.fx);
+    download(d_fy, f.fy);
+    download(d_fz, f.fz);
+    download(d_f4, f.f4);
+    download(d_vsigmax, f.vsigmax);
+    download(d_divv, f.divv);
 }
