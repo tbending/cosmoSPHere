@@ -318,13 +318,17 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     for (auto* e : {&e0, &e1, &e2, &e3}) checkGpuErrors(hipEventCreate(e));
     HIP_CHECK(hipEventRecord(e0));
 
+    // Every device buffer lives in GpuState and is resized to n, a no-op after the first
+    // call, so a force pass allocates nothing on the device.
+    const size_t nbytes = static_cast<size_t>(n) * sizeof(double);
+    s.fStage.resize(n);
+
     // phantom order -> Hilbert order (s.order maps sorted index -> phantom index)
-    auto upload = [&](const double* host)
+    auto upload = [&](const double* host, thrust::device_vector<double>& sorted)
     {
-        thrust::device_vector<double> phantomOrder(host, host + n);
-        thrust::device_vector<double> sorted(n);
-        thrust::gather(s.order.begin(), s.order.end(), phantomOrder.begin(), sorted.begin());
-        return sorted;
+        HIP_CHECK(hipMemcpy(rawPtr(s.fStage), host, nbytes, hipMemcpyHostToDevice));
+        sorted.resize(n);
+        thrust::gather(s.order.begin(), s.order.end(), s.fStage.begin(), sorted.begin());
     };
     // Positions and h: the solve's Hilbert-sorted copies are exactly what phantom holds
     // -- the positions it uploaded and the converged h it stored back -- and phantom
@@ -334,28 +338,28 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     const bool refreshV = (s.forceToken == s.token) || (int)s.vx.size() != n;
     if (refreshV)
     {
-        s.vx = upload(f.vx);
-        s.vy = upload(f.vy);
-        s.vz = upload(f.vz);
+        upload(f.vx, s.vx);
+        upload(f.vy, s.vy);
+        upload(f.vz, s.vz);
     }
     s.forceToken = s.token;
 
-    thrust::device_vector<double> d_pro2    = upload(f.pro2);
-    thrust::device_vector<double> d_spsound = upload(f.spsound);
-    thrust::device_vector<double> d_alphaAV = upload(f.alphaAV);
-    thrust::device_vector<double> d_u       = upload(f.u);
+    upload(f.pro2,    s.pro2);
+    upload(f.spsound, s.spsound);
+    upload(f.alphaAV, s.alphaAV);
+    upload(f.u,       s.u);
 
-    thrust::device_vector<double> d_fx(n, 0.0), d_fy(n, 0.0), d_fz(n, 0.0), d_f4(n, 0.0);
-    thrust::device_vector<double> d_vsigmax(n, 0.0), d_divv(n, 0.0);
+    // Not zeroed: the kernel writes all n entries of every output, dead particles included.
+    for (auto* v : {&s.fx, &s.fy, &s.fz, &s.f4, &s.vsigmax, &s.divvF}) v->resize(n);
     HIP_CHECK(hipEventRecord(e1));
 
     sphForceKernelJList<<<iceil(n, 256), 256>>>(
         rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
         rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
         rawPtr(s.h), rawPtr(s.gradh),
-        rawPtr(d_pro2), rawPtr(d_spsound), rawPtr(d_alphaAV), rawPtr(d_u),
-        rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
-        rawPtr(d_vsigmax), rawPtr(d_divv),
+        rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
+        rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
+        rawPtr(s.vsigmax), rawPtr(s.divvF),
         n, pmass, beta, alphau,
         rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
         rawPtr(s.layout));
@@ -364,19 +368,17 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     HIP_CHECK(hipDeviceSynchronize());
 
     // Hilbert order -> phantom order, then to the host
-    thrust::device_vector<double> d_out(n);
     auto download = [&](const thrust::device_vector<double>& sorted, double* host)
     {
-        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(host, rawPtr(d_out), static_cast<size_t>(n) * sizeof(double),
-                            hipMemcpyDeviceToHost));
+        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), s.fStage.begin());
+        HIP_CHECK(hipMemcpy(host, rawPtr(s.fStage), nbytes, hipMemcpyDeviceToHost));
     };
-    download(d_fx, f.fx);
-    download(d_fy, f.fy);
-    download(d_fz, f.fz);
-    download(d_f4, f.f4);
-    download(d_vsigmax, f.vsigmax);
-    download(d_divv, f.divv);
+    download(s.fx, f.fx);
+    download(s.fy, f.fy);
+    download(s.fz, f.fz);
+    download(s.f4, f.f4);
+    download(s.vsigmax, f.vsigmax);
+    download(s.divvF, f.divv);
 
     HIP_CHECK(hipEventRecord(e3));
     checkGpuErrors(hipEventSynchronize(e3));
