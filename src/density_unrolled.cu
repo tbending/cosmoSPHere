@@ -644,17 +644,19 @@ DensTimings solveDensH(// Host input/output
                         int n,
                         double pmass,
                         KernelMode mode,
-                        const GradFields* grads)
+                        const GradFields* grads,
+                        const double* periodicBox)
 {
     const int ngas = n;
     DensTimings t{};
     t.kernelMode = mode;
 
     // This variant exists only for the standalone unrolled-inner-loop benchmark
-    // and has no gradient sweep; the phantom path uses density_base.cu.
-    if (grads)
+    // and has no gradient sweep or periodic boundaries; the phantom path uses
+    // density_base.cu.
+    if (grads || periodicBox)
     {
-        std::fprintf(stderr, "solveDensH (unrolled): gradient fields not supported\n");
+        std::fprintf(stderr, "solveDensH (unrolled): gradient fields and periodic boundaries not supported\n");
         std::abort();
     }
 

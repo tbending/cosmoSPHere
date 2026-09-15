@@ -91,6 +91,7 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
 
 // SPH force on one particle per thread, over the symmetric j-leaf list.  Threads index
 // Hilbert-sorted particles.
+template<bool Periodic>
 __global__ void sphForceKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -118,7 +119,8 @@ __global__ void sphForceKernelJList(
     const int* __restrict__ jOffset,
     const int* __restrict__ jcount,
     const int* __restrict__ jlist,
-    const unsigned* __restrict__ layout)
+    const unsigned* __restrict__ layout,
+    Box<double> box)
 {
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) return;
@@ -182,6 +184,7 @@ __global__ void sphForceKernelJList(
             double dx  = xi - x[j];
             double dy  = yi - y[j];
             double dz  = zi - z[j];
+            nearestImage<Periodic>(dx, dy, dz, box);
             double dr2 = dx*dx + dy*dy + dz*dz;
             if (!(dr2 > 0.0)) continue;
             double qij2 = dr2 * hi_sq_inv;
@@ -353,16 +356,19 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     for (auto* v : {&s.fx, &s.fy, &s.fz, &s.f4, &s.vsigmax, &s.divvF}) v->resize(n);
     HIP_CHECK(hipEventRecord(e1));
 
-    sphForceKernelJList<<<iceil(n, 256), 256>>>(
-        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-        rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
-        rawPtr(s.h), rawPtr(s.gradh),
-        rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
-        rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
-        rawPtr(s.vsigmax), rawPtr(s.divvF),
-        n, pmass, beta, alphau,
-        rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-        rawPtr(s.layout));
+    // Periodic or not is whatever the density solve built this tree with.
+    dispatchPeriodic(s.box, [&](auto periodic) {
+        sphForceKernelJList<decltype(periodic)::value><<<iceil(n, 256), 256>>>(
+            rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+            rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
+            rawPtr(s.h), rawPtr(s.gradh),
+            rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
+            rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
+            rawPtr(s.vsigmax), rawPtr(s.divvF),
+            n, pmass, beta, alphau,
+            rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+            rawPtr(s.layout), s.box);
+    });
     checkGpuErrors(cudaGetLastError());
     HIP_CHECK(hipEventRecord(e2));
     HIP_CHECK(hipDeviceSynchronize());

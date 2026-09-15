@@ -17,6 +17,10 @@
  *              the velocity gradient tensor, which is not returned
  *   ddivvdt  — d(div v)/dt for the Cullen & Dehnen switch (out)
  *
+ * periodic/box select periodic boundaries, as phantom's PERIODIC: pairs and tree
+ * nodes are taken at their nearest image in the box.  The caller must have wrapped
+ * the particles into the box (phantom's cross_boundary).
+ *
  * The last three replace the CPU densityiterate(icall=3) sweep that the
  * phantom GPU path used to run after the GPU solve; vx/vy/vz and ax/ay/az
  * (= fxyzu + fext) are the extra inputs they need.
@@ -55,7 +59,9 @@ extern "C" void densityiterate_gpu_c(
     const double* ay,
     const double* az,
     int           n,
-    double        pmass)
+    double        pmass,
+    int           periodic,  // nonzero: periodic in x, y and z
+    const double* box)       // {xmin, xmax, ymin, ymax, zmin, zmax}; read only if periodic
 {
     // Set COSMO_DENS_STATS=1 for a one-line phase breakdown per solve on stderr.
     // Costs two clock reads when off.
@@ -67,7 +73,8 @@ extern "C" void densityiterate_gpu_c(
 
     auto t1 = clk::now();
     DensTimings t = solveDensH(h, rho, gradh_out, x, y, z, n, pmass,
-                               KernelMode::FLAT_PARTICLE, &grads);
+                               KernelMode::FLAT_PARTICLE, &grads,
+                               periodic ? box : nullptr);
     auto t2 = clk::now();
 
     // COSMO_MEM: one line per run with device memory in use and the host high-water
