@@ -63,7 +63,10 @@ void buildTree(GpuState& s,
     // -----------------------------------------------------------------------
     // Hilbert keys + GPU sort
     // -----------------------------------------------------------------------
-    thrust::device_vector<uint64_t> d_keys(ngas);
+    // Keys and the gather scratch live in `s`, so a tree build allocates no particle-
+    // sized buffers.  The sorted arrays are swapped with sortTmp, both persistent.
+    auto& d_keys = s.keys;
+    d_keys.resize(ngas);
 
     constexpr int BLK = 256;
     computeHilbertKeysKernel<<<iceil(ngas, BLK), BLK>>>(
@@ -82,7 +85,8 @@ void buildTree(GpuState& s,
     s.nAlive = (int)(thrust::lower_bound(thrust::device, d_keys.begin(), d_keys.end(),
                                          ~uint64_t(0)) - d_keys.begin());
 
-    thrust::device_vector<double> d_tmp(ngas);
+    auto& d_tmp = s.sortTmp;
+    d_tmp.resize(ngas);
     for (auto* v : {&s.x, &s.y, &s.z, &s.h})
     {
         thrust::gather(s.order.begin(), s.order.end(), v->begin(), d_tmp.begin());

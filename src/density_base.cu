@@ -36,6 +36,7 @@
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 #include <thrust/copy.h>
+#include <thrust/fill.h>
 #include <thrust/iterator/permutation_iterator.h>
 
 #include "kernel.hpp"
@@ -720,11 +721,16 @@ DensTimings solveDensH(// Host input/output
     s.h.assign(h_host, h_host + x_host.size());
     s.rho.assign(ngas, 0.0);
     s.gradh.assign(ngas, 0.0);
-    thrust::device_vector<int> d_converged(ngas, 0);
+    // Scratch lives in `s` and is resized, not reallocated, on each solve.
+    auto& d_converged = s.converged;
+    d_converged.resize(ngas);
+    thrust::fill(d_converged.begin(), d_converged.end(), 0);
 
     // Velocity and acceleration are only needed for the gradient sweep.  Velocity
     // persists because force needs it; acceleration does not.
-    thrust::device_vector<double> d_ax, d_ay, d_az;
+    auto& d_ax = s.ax;
+    auto& d_ay = s.ay;
+    auto& d_az = s.az;
     s.vx.clear(); s.vy.clear(); s.vz.clear();
     std::vector<thrust::device_vector<double>*> alsoSort;
     if (grads)
@@ -755,10 +761,14 @@ DensTimings solveDensH(// Host input/output
 
     // Active sets — start as all particles / all leaves, compacted to the
     // unconverged ones after each iteration.
-    thrust::device_vector<int> d_activeParticles(ngas);
-    thrust::device_vector<int> d_activeTmp(ngas);       // scratch for copy_if
-    thrust::device_vector<int> d_activeLeaves(nLeaves);
-    thrust::device_vector<int> d_activeLeavesTmp(ngas); // scratch (ngas upper bound)
+    auto& d_activeParticles = s.activeParticles;
+    auto& d_activeTmp       = s.activeTmp;         // scratch for copy_if
+    auto& d_activeLeaves    = s.activeLeaves;
+    auto& d_activeLeavesTmp = s.activeLeavesTmp;   // scratch (ngas upper bound)
+    d_activeParticles.resize(ngas);
+    d_activeTmp.resize(ngas);
+    d_activeLeaves.resize(nLeaves);
+    d_activeLeavesTmp.resize(ngas);
     // Solve for live particles only: dead ones sit past nAlive in the Hilbert order,
     // belong to no leaf, and keep the negative h phantom gave them.
     thrust::sequence(d_activeParticles.begin(), d_activeParticles.begin() + s.nAlive);
@@ -883,7 +893,9 @@ DensTimings solveDensH(// Host input/output
     // rebuild them for EVERY leaf at the converged h before sweeping all particles
     // once.  That full-tree hmax pass is also what the force walk relies on.
     // ---------------------------------------------------------------
-    thrust::device_vector<double> d_divv, d_ddivvdt, d_dvdx;
+    auto& d_divv = s.divv;
+    auto& d_ddivvdt = s.ddivvdt;
+    auto& d_dvdx = s.dvdx;
     if (grads)
     {
         d_divv.resize(ngas);
@@ -935,7 +947,8 @@ DensTimings solveDensH(// Host input/output
     // to phantom's order with s.order (sorted index -> original index).
     HIP_CHECK(hipEventRecord(evDl0));
     {
-        thrust::device_vector<double> d_out(ngas);
+        auto& d_out = s.dStage;
+        d_out.resize(ngas);
         thrust::scatter(s.h.begin(),     s.h.end(),     s.order.begin(), d_out.begin());
         HIP_CHECK(hipMemcpy(h_host,     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         thrust::scatter(s.rho.begin(),   s.rho.end(),   s.order.begin(), d_out.begin());
@@ -950,7 +963,8 @@ DensTimings solveDensH(// Host input/output
             thrust::scatter(d_ddivvdt.begin(), d_ddivvdt.end(), s.order.begin(), d_out.begin());
             HIP_CHECK(hipMemcpy(grads->ddivvdt, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
 
-            thrust::device_vector<double> d_dvdxOut((size_t)9 * ngas);
+            auto& d_dvdxOut = s.dvdxStage;
+            d_dvdxOut.resize((size_t)9 * ngas);
             scatterDvdxKernel<<<iceil(ngas, 256), 256>>>(
                 rawPtr(d_dvdx), rawPtr(s.order), rawPtr(d_dvdxOut), ngas);
             checkGpuErrors(cudaGetLastError());

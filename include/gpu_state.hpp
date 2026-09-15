@@ -65,6 +65,14 @@ struct GpuState
     thrust::device_vector<int> allLeaves;        // 0..nLeaves-1, for whole-tree list builds
     thrust::device_vector<int> overflow;         // [0] list truncations, [1] stack drops
 
+    // ---- density solve and tree build scratch, resized per call and reused ----
+    thrust::device_vector<uint64_t> keys;        // Hilbert keys
+    thrust::device_vector<double> sortTmp;       // gather target, swapped with each sorted array
+    thrust::device_vector<double> ax, ay, az;    // acceleration, gradient sweep only
+    thrust::device_vector<int> converged, activeParticles, activeTmp, activeLeaves, activeLeavesTmp;
+    thrust::device_vector<double> divv, ddivvdt, dvdx;   // gradient sweep outputs, Hilbert order
+    thrust::device_vector<double> dStage, dvdxStage;     // phantom-order staging for downloads
+
     // ---- force pass buffers, sized to ngas and reused across calls ----
     thrust::device_vector<double> pro2, spsound, alphaAV, u;         // inputs, Hilbert order
     thrust::device_vector<double> fx, fy, fz, f4, vsigmax, divvF;   // outputs, Hilbert order
