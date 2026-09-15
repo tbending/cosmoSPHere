@@ -2,11 +2,11 @@
  * force_c_api.cu — C-linkage entry point for the GPU force pass.
  *
  * Mirrors phantom's structure: densityiterate and force are two separate calls
- * (deriv.F90 :139 and :195), so this is its own entry point.  It rebuilds nothing —
- * the tree, the Hilbert-sorted particles, the converged h, rho, gradh, velocities and
- * the leaf bookkeeping were all left in gpuState() by densityiterate_gpu_c.
+ * (deriv.F90 :139 and :195), so this is its own entry point.  It rebuilds no tree:
+ * the Hilbert ordering, gradh and the leaf bookkeeping were left in gpuState() by
+ * densityiterate_gpu_c.  The work is done by computeForces (force.cu).
  *
- * PARTICLE ORDERING — read before adding an argument.
+ * PARTICLE ORDERING — read before adding an argument (applies in computeForces).
  * Phantom's arrays are in phantom's order; everything in the state is Hilbert-sorted.
  * s.order maps sorted index -> phantom index, so:
  *   - a NEW input must be gathered:   thrust::gather(order.begin(), order.end(),
@@ -22,10 +22,28 @@
 #include <cstdio>
 #include <cstdlib>
 
-// Output arrays are deliberately absent: this currently builds the symmetric j-leaf
-// list and nothing else, so there is nothing to write back yet.  fx/fy/fz/dudt get
-// added to the signature together with the force kernel.
-extern "C" void force_gpu_c(int n, double pmass)
+extern "C" void force_gpu_c(
+    int n,
+    double pmass,
+    const double* x,
+    const double* y,
+    const double* z,
+    const double* h,
+    const double* vx,
+    const double* vy,
+    const double* vz,
+    const double* pro2,
+    const double* spsound,
+    const double* alphaAV,
+    const double* u,
+    double beta,
+    double alphau,
+    double* fx,
+    double* fy,
+    double* fz,
+    double* f4,
+    double* vsigmax,
+    double* divv)
 {
     GpuState& s = gpuState();
 
@@ -40,14 +58,10 @@ extern "C" void force_gpu_c(int n, double pmass)
         std::abort();
     }
 
+    ForceFields f{x, y, z, h, vx, vy, vz, pro2, spsound, alphaAV, u,
+                  fx, fy, fz, f4, vsigmax, divv};
     ForceTimings ft;
-    buildForceJLeafList(s, ft);
-
-    // =======================================================================
-    // >>> CALL THE FORCE KERNEL HERE <<<
-    // =======================================================================
-
-    (void)pmass;   // until the kernel lands
+    computeForces(s, f, pmass, beta, alphau, ft);
 
     // Same env gate as the density solve, so one setting shows the whole picture.
     static const bool stats = (std::getenv("COSMO_DENS_STATS") != nullptr);

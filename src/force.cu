@@ -9,9 +9,13 @@
 #include "tree.cuh"
 #include "kernel.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <vector>
 
+#include <thrust/device_vector.h>
+#include <thrust/gather.h>
+#include <thrust/scatter.h>
 #include <thrust/sequence.h>
 
 void buildForceJLeafList(GpuState& s, ForceTimings& ft)
@@ -95,3 +99,280 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
             ovf[0], ovf[1]);
 }
 
+// SPH force on one particle per thread, over the symmetric j-leaf list.  Threads index
+// Hilbert-sorted particles.
+__global__ void sphForceKernelJList(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const double* __restrict__ z,
+    const double* __restrict__ vx,
+    const double* __restrict__ vy,
+    const double* __restrict__ vz,
+    const double* __restrict__ h,
+    const double* __restrict__ gradh,
+    const double* __restrict__ pro2,
+    const double* __restrict__ spsound,
+    const double* __restrict__ alphaAV,
+    const double* __restrict__ u,
+    double* __restrict__ fx,
+    double* __restrict__ fy,
+    double* __restrict__ fz,
+    double* __restrict__ f4,
+    double* __restrict__ vsigmax,
+    double* __restrict__ divv,
+    int n,
+    double pmass,
+    double beta,
+    double alphau,
+    const int* __restrict__ particleLeaf,
+    const int* __restrict__ jcount,
+    const int* __restrict__ jlist,
+    const unsigned* __restrict__ layout)
+{
+    const int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= n) return;
+
+    const double hi = h[i];
+
+    // Dead particles (h <= 0): no force, and skip the neighbour loop.
+    if (!(hi > 0.0))
+    {
+        fx[i]      = 0.0;
+        fy[i]      = 0.0;
+        fz[i]      = 0.0;
+        f4[i]      = 0.0;
+        vsigmax[i] = 0.0;
+        divv[i]    = 0.0;
+        return;
+    }
+
+    const double xi = x[i], yi = y[i], zi = z[i];
+    const double hi_sq_inv = 1.0 / (hi * hi);
+    const double hi_4_inv  = hi_sq_inv * hi_sq_inv;
+
+    // rhoh(hi), as in phantom's force.F90, not the summed density
+    const double hfoh_i = sph::hfact / hi;
+    const double rhoi   = pmass * hfoh_i * hfoh_i * hfoh_i;
+
+    const double grad_i      = gradh[i];   // d(rho)/dh at fixed q, from the density solve
+    const double dhdrhoi     = -hi / (3.0 * rhoi);
+    const double omegai      = 1.0 - dhdrhoi * grad_i;
+    const double omega_inv_i = 1 / omegai;
+    const double hfacgrkerni = hi_4_inv * sph::cnormk * omega_inv_i;   // hfacgrkern in force.F90
+
+    const double pro2i   = pro2[i];
+    const double vwavei  = spsound[i];
+    const double alphai  = alphaAV[i];
+    const double eni     = u[i];
+    const double rho1i   = 1.0 / rhoi;
+    const double pri     = pro2i * rhoi * rhoi;
+    const double autermi = 0.5 * pmass * rho1i * alphau;
+
+    double itermx = 0.0;   // force from neighbours inside h_i
+    double itermy = 0.0;
+    double itermz = 0.0;
+    double jtermx = 0.0;   // force from neighbours inside h_j
+    double jtermy = 0.0;
+    double jtermz = 0.0;
+
+    double f4sum     = 0.0;   // du/dt
+    double vsigmax_i = 0.0;
+    double divv_s    = 0.0;
+
+    const int iLeaf = particleLeaf[i];
+    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int nj    = jcount[iLeaf];
+
+    for (int jl = 0; jl < nj; ++jl)
+    {
+        const int jLeaf = jlist[jBase + jl];
+        for (unsigned j = layout[jLeaf]; j < layout[jLeaf + 1]; ++j)
+        {
+            double dx  = xi - x[j];
+            double dy  = yi - y[j];
+            double dz  = zi - z[j];
+            double dr2 = dx*dx + dy*dy + dz*dz;
+            if (!(dr2 > 0.0)) continue;
+            double qij2 = dr2 * hi_sq_inv;
+
+            const double hj        = h[j];
+            const double hj_sq_inv = 1.0 / (hj * hj);
+            const double hj_4_inv  = hj_sq_inv * hj_sq_inv;
+
+            double qj_ij2 = dr2 * hj_sq_inv;
+
+            double dr    = sqrt(dr2);
+            double runix = dx / dr;   // unit vector (r_i - r_j) / |r_i - r_j|
+            double runiy = dy / dr;
+            double runiz = dz / dr;
+            const double dvxij = vx[i] - vx[j];
+            const double dvyij = vy[i] - vy[j];
+            const double dvzij = vz[i] - vz[j];
+            const double projv = dvxij * runix + dvyij * runiy + dvzij * runiz;
+
+            // rhoh(hj)
+            const double hfoh_j = sph::hfact / hj;
+            const double rhoj   = pmass * hfoh_j * hfoh_j * hfoh_j;
+
+            const double rho1j   = 1.0 / rhoj;
+            const double pro2j   = pro2[j];
+            const double vwavej  = spsound[j];
+            const double alphaj  = alphaAV[j];
+            const double enj     = u[j];
+
+            const double prj     = pro2j * rhoj * rhoj;
+            const double autermj = 0.5 * pmass * rho1j * alphau;
+
+            // signal speeds: vsig* with alpha = 1 for the timestep,
+            // vsigav* with the particle's alpha for the viscosity
+            const double vsigi   = fmax(vwavei - beta * projv, 0.0);
+            const double vsigavi = fmax(alphai * vwavei - beta * projv, 0.0);
+            const double vsigj   = fmax(vwavej - beta * projv, 0.0);
+            const double vsigavj = fmax(alphaj * vwavej - beta * projv, 0.0);
+
+            const double pair_vsigmax = fmax(vsigi, vsigj);
+
+            double qrho2i = 0.0;
+            double qrho2j = 0.0;
+
+            const double denij  = eni - enj;
+            const double rhoav1 = 2.0 / (rhoi + rhoj);
+            const double vsigu  = sqrt(fabs(pri - prj) * rhoav1);
+
+            if (projv < 0.0)
+            {
+                qrho2i = -0.5 * rho1i * vsigavi * projv;
+                qrho2j = -0.5 * rho1j * vsigavj * projv;
+            }
+
+            if (qij2 < sph::radk2)
+            {
+                vsigmax_i = fmax(vsigmax_i, pair_vsigmax);
+
+                double qij, wij, grwij;
+                qij = sqrt(qij2);
+                sph::m4_kern(qij, wij, grwij);
+
+                // div v, as in sphGradientsKernel
+                const double rij1_divv       = 1.0 / (dr + 2.220446049250313e-16);
+                const double rij1grkern_divv = rij1_divv * grwij;
+
+                const double runix_divv = dx * rij1grkern_divv * pmass;
+                const double runiy_divv = dy * rij1grkern_divv * pmass;
+                const double runiz_divv = dz * rij1grkern_divv * pmass;
+
+                divv_s += dvxij * runix_divv
+                        + dvyij * runiy_divv
+                        + dvzij * runiz_divv;
+
+                const double gradkerni = grwij * hfacgrkerni;   // F_ij(h_i) / omega_i
+
+                const double gradpi = pmass * (pro2i + qrho2i) * gradkerni;
+
+                itermx += -gradpi * runix;
+                itermy += -gradpi * runiy;
+                itermz += -gradpi * runiz;
+
+                // du/dt: p dV work, viscous heating, conductivity
+                const double pdvtermi     = pmass * pro2i * projv * gradkerni;
+                const double dudtdissi    = pmass * qrho2i * projv * gradkerni;
+                const double dendisstermi = vsigu * denij * autermi * gradkerni;
+
+                f4sum += pdvtermi;
+                f4sum += dudtdissi;
+                f4sum += dendisstermi;
+            }
+
+            if (qj_ij2 < sph::radk2)
+            {
+                vsigmax_i = fmax(vsigmax_i, pair_vsigmax);
+
+                double qj_ij, wj_ij, grwj_ij;
+                qj_ij = sqrt(qj_ij2);
+                sph::m4_kern(qj_ij, wj_ij, grwj_ij);
+
+                const double dhdrhoj     = -hj / (3.0 * rhoj);
+                const double grad_j      = gradh[j];
+                const double omegaj      = 1.0 - dhdrhoj * grad_j;
+                const double omega_inv_j = 1 / omegaj;
+
+                double hfacgrkernj = hj_4_inv * sph::cnormk * omega_inv_j;
+                double gradkernj   = grwj_ij * hfacgrkernj;   // F_ij(h_j) / omega_j
+
+                const double gradpj = pmass * (pro2j + qrho2j) * gradkernj;
+
+                jtermx -= gradpj * runix;
+                jtermy -= gradpj * runiy;
+                jtermz -= gradpj * runiz;
+
+                const double dendisstermj = vsigu * denij * autermj * gradkernj;
+
+                f4sum += dendisstermj;
+            }
+        }
+    }
+
+    fx[i]      = itermx + jtermx;
+    fy[i]      = itermy + jtermy;
+    fz[i]      = itermz + jtermz;
+    f4[i]      = f4sum;
+    vsigmax[i] = vsigmax_i;
+
+    const double term_divv = sph::cnormk * omega_inv_i * hi_4_inv / rhoi;
+
+    divv[i] = -divv_s * term_divv;
+}
+
+void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
+                   double alphau, ForceTimings& ft)
+{
+    const int n = s.ngas;
+
+    buildForceJLeafList(s, ft);
+
+    // phantom order -> Hilbert order (s.order maps sorted index -> phantom index)
+    auto upload = [&](const double* host)
+    {
+        thrust::device_vector<double> phantomOrder(host, host + n);
+        thrust::device_vector<double> sorted(n);
+        thrust::gather(s.order.begin(), s.order.end(), phantomOrder.begin(), sorted.begin());
+        return sorted;
+    };
+    thrust::device_vector<double> d_x  = upload(f.x),  d_y  = upload(f.y),  d_z  = upload(f.z);
+    thrust::device_vector<double> d_h  = upload(f.h);
+    thrust::device_vector<double> d_vx = upload(f.vx), d_vy = upload(f.vy), d_vz = upload(f.vz);
+    thrust::device_vector<double> d_pro2    = upload(f.pro2);
+    thrust::device_vector<double> d_spsound = upload(f.spsound);
+    thrust::device_vector<double> d_alphaAV = upload(f.alphaAV);
+    thrust::device_vector<double> d_u       = upload(f.u);
+
+    thrust::device_vector<double> d_fx(n, 0.0), d_fy(n, 0.0), d_fz(n, 0.0), d_f4(n, 0.0);
+    thrust::device_vector<double> d_vsigmax(n, 0.0), d_divv(n, 0.0);
+
+    sphForceKernelJList<<<iceil(n, 256), 256>>>(
+        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
+        rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
+        rawPtr(d_h), rawPtr(s.gradh),
+        rawPtr(d_pro2), rawPtr(d_spsound), rawPtr(d_alphaAV), rawPtr(d_u),
+        rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
+        rawPtr(d_vsigmax), rawPtr(d_divv),
+        n, pmass, beta, alphau,
+        rawPtr(s.particleLeaf), rawPtr(s.jcount), rawPtr(s.jlist), rawPtr(s.layout));
+    checkGpuErrors(cudaGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+
+    // Hilbert order -> phantom order, then to the host
+    thrust::device_vector<double> d_out(n);
+    auto download = [&](const thrust::device_vector<double>& sorted, double* host)
+    {
+        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), d_out.begin());
+        HIP_CHECK(hipMemcpy(host, rawPtr(d_out), static_cast<size_t>(n) * sizeof(double),
+                            hipMemcpyDeviceToHost));
+    };
+    download(d_fx, f.fx);
+    download(d_fy, f.fy);
+    download(d_fz, f.fz);
+    download(d_f4, f.f4);
+    download(d_vsigmax, f.vsigmax);
+    download(d_divv, f.divv);
+}
