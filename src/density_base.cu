@@ -484,6 +484,35 @@ __global__ void sphDensityKernelLeafWarp(
 // Assumes a single particle type (all masses = pmass), which is what the phantom
 // GPU path passes; the CPU restricts the sums to same-type neighbours.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Phantom's Cullen & Dehnen xi limiter (shock_capturing.f90 xi_limiter), from the
+// velocity gradient tensor g in phantom's dvdx ordering.
+//
+// The host used to receive all nine components and evaluate this itself.  To give
+// the same bits, mirror what it does exactly: phantom stores dvdx as real(4), so
+// each component is rounded to float and promoted back, and the arithmetic runs in
+// the same order.  Contraction into fused multiply-adds is switched off for clang
+// (hipcc); nvcc has no per-function control and may contract, which changes xi only
+// in the last bits.
+// ---------------------------------------------------------------------------
+__device__ inline double xiLimiter(const double g[9])
+{
+#if defined(__clang__)
+    #pragma clang fp contract(off)
+#endif
+    const double dvxdx = (float)g[0], dvxdy = (float)g[1], dvxdz = (float)g[2];
+    const double dvydx = (float)g[3], dvydy = (float)g[4], dvydz = (float)g[5];
+    const double dvzdx = (float)g[6], dvzdy = (float)g[7], dvzdz = (float)g[8];
+    const double divv   = dvxdx + dvydy + dvzdz;
+    const double curlvx = dvzdy - dvydz;
+    const double curlvy = dvxdz - dvzdx;
+    const double curlvz = dvydx - dvxdy;
+    const double mdiv   = fmax(-divv, 0.0);
+    const double fac    = mdiv * mdiv;
+    const double traceS = curlvx*curlvx + curlvy*curlvy + curlvz*curlvz;
+    return (fac + traceS > 2.220446049250313e-16) ? fac / (fac + traceS) : 1.0;   // epsilon(0.)
+}
+
 __global__ void sphGradientsKernel(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -498,7 +527,7 @@ __global__ void sphGradientsKernel(
     double*       rho,                   // out, re-evaluated at converged h
     double*       gradh,                 // out, d(rho)/d(h) at converged h
     double*       divv,                  // out
-    double*       dvdx,                  // out, component-major: dvdx[c*ngas + i]
+    double*       xiLim,                 // out, Cullen & Dehnen xi limiter
     double*       ddivvdt,               // out
     int           ngas,
     double        pmass,
@@ -516,7 +545,7 @@ __global__ void sphGradientsKernel(
     if (!(h[i] > 0.0))
     {
         divv[i] = 0.0; ddivvdt[i] = 0.0;
-        for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = 0.0;
+        xiLim[i] = 1.0;   // xi_limiter of a zero tensor
         return;
     }
 
@@ -600,7 +629,7 @@ __global__ void sphGradientsKernel(
     if (!(rho_i > 0.0))
     {
         divv[i] = 0.0; ddivvdt[i] = 0.0;
-        for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = 0.0;
+        xiLim[i] = 1.0;   // xi_limiter of a zero tensor
         return;
     }
 
@@ -659,25 +688,13 @@ __global__ void sphGradientsKernel(
         div_a = -term * (da[0] + da[4] + da[8]);
     }
 
-    for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = g[c];
+    // xi is the only use of the full tensor outside this kernel, so it is formed here
+    // and the nine components never leave the device.
+    xiLim[i] = xiLimiter(g);
 
     // divcurlvi(5): div_a minus the nonlinear tr(dv.dv) term
     ddivvdt[i] = div_a - (g[0]*g[0] + g[4]*g[4] + g[8]*g[8]
                           + 2.0*(g[1]*g[3] + g[2]*g[6] + g[5]*g[7]));
-}
-
-// Undo the Hilbert sort for the 9-component tensor and interleave it into the
-// (9,n) layout phantom expects, in one pass: out[9*orig + c] = in[c*ngas + srt].
-__global__ void scatterDvdxKernel(const double* __restrict__ in,
-                                  const int*    __restrict__ order,
-                                  double*       __restrict__ out,
-                                  int ngas)
-{
-    int srt = blockDim.x * blockIdx.x + threadIdx.x;
-    if (srt >= ngas) return;
-    const int orig = order[srt];
-    for (int c = 0; c < 9; ++c)
-        out[(size_t)9*orig + c] = in[(size_t)c*ngas + srt];
 }
 
 
@@ -896,12 +913,12 @@ DensTimings solveDensH(// Host input/output
     // ---------------------------------------------------------------
     auto& d_divv = s.divv;
     auto& d_ddivvdt = s.ddivvdt;
-    auto& d_dvdx = s.dvdx;
+    auto& d_xi = s.xi;
     if (grads)
     {
         d_divv.resize(ngas);
         d_ddivvdt.resize(ngas);
-        d_dvdx.resize((size_t)9 * ngas);
+        d_xi.resize(ngas);
 
         cudaEvent_t evG0, evGJ, evG1;
         checkGpuErrors(hipEventCreate(&evG0));
@@ -926,7 +943,7 @@ DensTimings solveDensH(// Host input/output
             rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
             rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
             rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh),
-            rawPtr(d_divv), rawPtr(d_dvdx), rawPtr(d_ddivvdt),
+            rawPtr(d_divv), rawPtr(d_xi), rawPtr(d_ddivvdt),
             ngas, pmass,
             rawPtr(s.particleLeaf),
             rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
@@ -964,13 +981,8 @@ DensTimings solveDensH(// Host input/output
             thrust::scatter(d_ddivvdt.begin(), d_ddivvdt.end(), s.order.begin(), d_out.begin());
             HIP_CHECK(hipMemcpy(grads->ddivvdt, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
 
-            auto& d_dvdxOut = s.dvdxStage;
-            d_dvdxOut.resize((size_t)9 * ngas);
-            scatterDvdxKernel<<<iceil(ngas, 256), 256>>>(
-                rawPtr(d_dvdx), rawPtr(s.order), rawPtr(d_dvdxOut), ngas);
-            checkGpuErrors(cudaGetLastError());
-            HIP_CHECK(hipMemcpy(grads->dvdx, rawPtr(d_dvdxOut),
-                                (size_t)9*ngas*sizeof(double), hipMemcpyDeviceToHost));
+            thrust::scatter(d_xi.begin(), d_xi.end(), s.order.begin(), d_out.begin());
+            HIP_CHECK(hipMemcpy(grads->xi, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         }
     }
     HIP_CHECK(hipEventRecord(evDl1));

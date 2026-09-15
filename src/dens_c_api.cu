@@ -13,8 +13,8 @@
  *              gpu_dens_iface.F90 performs that conversion, and needs rho
  *              in order to do it.
  *   divv     — div v (out)
- *   dvdx     — velocity gradient tensor, 9*n, laid out to match Fortran's
- *              dvdx(1:9,i), i.e. dvdx[9*i + c] (out)
+ *   xi       — Cullen & Dehnen xi limiter (out), formed on the device from
+ *              the velocity gradient tensor, which is not returned
  *   ddivvdt  — d(div v)/dt for the Cullen & Dehnen switch (out)
  *
  * The last three replace the CPU densityiterate(icall=3) sweep that the
@@ -43,7 +43,7 @@ extern "C" void densityiterate_gpu_c(
     double*       rho,       // out:    density
     double*       gradh_out, // out:    d(rho)/d(h) normalised
     double*       divv,      // out:    div v
-    double*       dvdx,      // out:    velocity gradient tensor, 9*n
+    double*       xi,        // out:    xi limiter
     double*       ddivvdt,   // out:    d(div v)/dt
     const double* x,
     const double* y,
@@ -63,7 +63,7 @@ extern "C" void densityiterate_gpu_c(
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
 
-    GradFields grads{vx, vy, vz, ax, ay, az, divv, dvdx, ddivvdt};
+    GradFields grads{vx, vy, vz, ax, ay, az, divv, xi, ddivvdt};
 
     auto t1 = clk::now();
     DensTimings t = solveDensH(h, rho, gradh_out, x, y, z, n, pmass,

@@ -70,8 +70,8 @@ struct GpuState
     thrust::device_vector<double> sortTmp;       // gather target, swapped with each sorted array
     thrust::device_vector<double> ax, ay, az;    // acceleration, gradient sweep only
     thrust::device_vector<int> converged, activeParticles, activeTmp, activeLeaves, activeLeavesTmp;
-    thrust::device_vector<double> divv, ddivvdt, dvdx;   // gradient sweep outputs, Hilbert order
-    thrust::device_vector<double> dStage, dvdxStage;     // phantom-order staging for downloads
+    thrust::device_vector<double> divv, ddivvdt, xi;     // gradient sweep outputs, Hilbert order
+    thrust::device_vector<double> dStage;                // phantom-order staging for downloads
 
     // ---- force pass buffers, sized to ngas and reused across calls ----
     thrust::device_vector<double> pro2, spsound, alphaAV, u;         // inputs, Hilbert order

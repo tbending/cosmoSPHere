@@ -54,14 +54,14 @@ struct DensTimings
 // Optional second-pass fields: the SPH velocity and acceleration gradients that
 // phantom's densityiterate computes alongside the density.  Supplying this makes
 // solveDensH run ONE extra neighbour sweep after Newton convergence, evaluated at
-// the converged h, and fill divv/dvdx/ddivvdt.  rho and gradh are re-evaluated in
+// the converged h, and fill divv/xi/ddivvdt.  rho and gradh are re-evaluated in
 // the same sweep so that every returned field belongs to the same h (the Newton
 // loop necessarily leaves rho/gradh one step behind h).  Pass nullptr to skip the
 // sweep and get the density-only behaviour.
 //
 // Raw pointers rather than std::vector: these come straight from Fortran arrays
 // through the C API, and the inputs are read-only, so there is nothing to gain
-// from copying them into vectors first.  All arrays are length n except dvdx.
+// from copying them into vectors first.  All arrays are length n.
 struct GradFields
 {
     // inputs
@@ -69,7 +69,7 @@ struct GradFields
     const double* ax; const double* ay; const double* az;   // acceleration (fxyzu+fext)
     // outputs
     double* divv;      // div v
-    double* dvdx;      // velocity gradient tensor, 9*n, particle-major: dvdx[9*i + c]
+    double* xi;        // Cullen & Dehnen xi limiter, from the velocity gradient tensor
     double* ddivvdt;   // d(div v)/dt, the Cullen & Dehnen switch source term
 };
 
