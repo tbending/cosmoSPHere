@@ -752,10 +752,12 @@ DensTimings solveDensH(// Host input/output
 
         // Build particle layout (prefix-sum of counts → first particle per leaf).
         const int nLeaves = (int)nNodes(csTree);
+        // counts has exactly nLeaves entries; do not read past it (see tree.cu)
         thrust::device_vector<unsigned> d_layout(nLeaves + 1);
-        thrust::exclusive_scan(thrust::device,
-                               counts.begin(), counts.end() + 1,
-                               d_layout.begin(), 0u);
+        d_layout[0] = 0u;
+        thrust::inclusive_scan(thrust::device,
+                               counts.begin(), counts.end(),
+                               d_layout.begin() + 1);
 
         // -----------------------------------------------------------------------
         // Step 3 — Node centres and sizes

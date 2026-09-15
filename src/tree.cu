@@ -117,10 +117,15 @@ void buildTree(GpuState& s,
     // Particle layout (prefix-sum of counts → first particle of each leaf).
     s.nLeaves  = (int)nNodes(csTree);
     s.numNodes = s.octree.numNodes;
+    // layout[0] = 0, layout[L+1] = counts[0] + ... + counts[L].  counts has exactly
+    // nLeaves entries: scanning to counts.end() + 1, as this used to, read one element
+    // past the end on the device -- harmless while the next page happened to be mapped,
+    // an illegal-address fault when it was not.
     s.layout.resize(s.nLeaves + 1);
-    thrust::exclusive_scan(thrust::device,
-                           counts.begin(), counts.end() + 1,
-                           s.layout.begin(), 0u);
+    s.layout[0] = 0u;
+    thrust::inclusive_scan(thrust::device,
+                           counts.begin(), counts.end(),
+                           s.layout.begin() + 1);
     HIP_CHECK(hipEventRecord(e3));
 
     // -----------------------------------------------------------------------
