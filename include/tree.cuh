@@ -47,13 +47,19 @@ static constexpr unsigned BUCKET_SIZE = 64;
 static __global__ void computeHilbertKeysKernel(const double* __restrict__ x,
                                          const double* __restrict__ y,
                                          const double* __restrict__ z,
+                                         const double* __restrict__ h,   // signed: h <= 0 is dead
                                          uint64_t* __restrict__ keys,
                                          int n,
                                          Box<double> box)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i < n)
-        keys[i] = hilbert3D<uint64_t>(x[i], y[i], z[i], box);
+    if (i >= n) return;
+    // Dead and accreted particles (phantom marks them h <= 0) get the maximum key, so
+    // the sort that already happens parks them at the end, and the tree is built over
+    // the live prefix only.  Left in, a dead particle has no neighbours, Newton runs
+    // its h away, and that inflates hmax_leaf and the j-lists of every live particle
+    // sharing its leaf.  63-bit Hilbert keys never reach this value.
+    keys[i] = (h[i] > 0.0) ? hilbert3D<uint64_t>(x[i], y[i], z[i], box) : ~uint64_t(0);
 }
 
 // ---------------------------------------------------------------------------

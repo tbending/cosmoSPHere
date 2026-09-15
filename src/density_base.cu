@@ -510,6 +510,15 @@ __global__ void sphGradientsKernel(
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= ngas) return;
 
+    // Dead particles (h <= 0) sit past nAlive and belong to no leaf, so particleLeaf
+    // is not set for them: return zeros before reading it.
+    if (!(h[i] > 0.0))
+    {
+        divv[i] = 0.0; ddivvdt[i] = 0.0;
+        for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = 0.0;
+        return;
+    }
+
     const double xi = x[i],  yi = y[i],  zi = z[i];
     const double vxi = vx[i], vyi = vy[i], vzi = vz[i];
     const double axi = ax[i], ayi = ay[i], azi = az[i];
@@ -750,9 +759,11 @@ DensTimings solveDensH(// Host input/output
     thrust::device_vector<int> d_activeTmp(ngas);       // scratch for copy_if
     thrust::device_vector<int> d_activeLeaves(nLeaves);
     thrust::device_vector<int> d_activeLeavesTmp(ngas); // scratch (ngas upper bound)
-    thrust::sequence(d_activeParticles.begin(), d_activeParticles.end());
+    // Solve for live particles only: dead ones sit past nAlive in the Hilbert order,
+    // belong to no leaf, and keep the negative h phantom gave them.
+    thrust::sequence(d_activeParticles.begin(), d_activeParticles.begin() + s.nAlive);
     thrust::sequence(d_activeLeaves.begin(),   d_activeLeaves.end());
-    int nActive       = ngas;
+    int nActive       = s.nAlive;
     int nActiveLeaves = nLeaves;
 
     // -----------------------------------------------------------------------

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <vector>
 
+#include <thrust/binary_search.h>
 #include <thrust/execution_policy.h>
 #include <thrust/extrema.h>
 #include <thrust/gather.h>
@@ -66,14 +67,20 @@ void buildTree(GpuState& s,
 
     constexpr int BLK = 256;
     computeHilbertKeysKernel<<<iceil(ngas, BLK), BLK>>>(
-        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z), rawPtr(s.h),
         rawPtr(d_keys), ngas, s.box);
     checkGpuErrors(cudaGetLastError());
 
-    // Sort permutation by Hilbert key, then gather particle data.
+    // Sort permutation by Hilbert key, then gather particle data.  Dead particles carry
+    // the maximum key, so this same sort parks them at the end.
     s.order.resize(ngas);
     thrust::sequence(s.order.begin(), s.order.end());
     thrust::sort_by_key(d_keys.begin(), d_keys.end(), s.order.begin());
+
+    // Live prefix: everything before the first maximum key.  The gathers below still
+    // cover all ngas, so the dead tail keeps its own data; only the TREE is restricted.
+    s.nAlive = (int)(thrust::lower_bound(thrust::device, d_keys.begin(), d_keys.end(),
+                                         ~uint64_t(0)) - d_keys.begin());
 
     thrust::device_vector<double> d_tmp(ngas);
     for (auto* v : {&s.x, &s.y, &s.z, &s.h})
@@ -92,12 +99,12 @@ void buildTree(GpuState& s,
     // Cornerstone leaf tree + fully linked internal tree
     // -----------------------------------------------------------------------
     thrust::device_vector<uint64_t>      csTree = std::vector<uint64_t>{0, nodeRange<uint64_t>(0)};
-    thrust::device_vector<unsigned>      counts = std::vector<unsigned>{(unsigned)ngas};
+    thrust::device_vector<unsigned>      counts = std::vector<unsigned>{(unsigned)s.nAlive};
     thrust::device_vector<uint64_t>      tmpTree;
     thrust::device_vector<TreeNodeIndex> workArray;
 
     // d_keys is already sorted — run update until the leaf partition is stable.
-    while (!updateOctreeGpu(rawPtr(d_keys), rawPtr(d_keys) + ngas,
+    while (!updateOctreeGpu(rawPtr(d_keys), rawPtr(d_keys) + s.nAlive,
                             BUCKET_SIZE, csTree, counts, tmpTree, workArray))
     {
         // iterate until stable leaf partition
@@ -137,7 +144,7 @@ void buildTree(GpuState& s,
         s.numNodes, rawPtr(s.leafToInternal));
     checkGpuErrors(cudaGetLastError());
 
-    s.particleLeaf.resize(ngas);
+    s.particleLeaf.resize(ngas);   // entries past nAlive are never set and never read
     buildParticleToLeafKernel<<<iceil(s.nLeaves, 256), 256>>>(
         rawPtr(s.layout), s.nLeaves, rawPtr(s.particleLeaf));
     checkGpuErrors(cudaGetLastError());

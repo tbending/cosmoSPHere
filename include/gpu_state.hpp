@@ -66,6 +66,10 @@ struct GpuState
     thrust::device_vector<int> overflow;         // [0] list truncations, [1] stack drops
 
     int ngas     = 0;
+    // Live particles (h > 0) form the prefix [0, nAlive) of the Hilbert order; dead
+    // ones sit after it, belong to no leaf, never enter a j-list, and keep the values
+    // phantom gave them (in particular their negative h).
+    int nAlive   = 0;
     int nLeaves  = 0;
     int numNodes = 0;
 
