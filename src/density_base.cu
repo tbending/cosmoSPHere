@@ -689,9 +689,10 @@ DensTimings solveDensH(// Host input/output
                         double* rho_host,
                         double* gradh_host,
                         // Host input (read-only)
-                        const std::vector<double>& x_host,
-                        const std::vector<double>& y_host,
-                        const std::vector<double>& z_host,
+                        const double* x_host,
+                        const double* y_host,
+                        const double* z_host,
+                        int n,
                         double pmass,
                         KernelMode mode,
                         const GradFields* grads)
@@ -699,7 +700,7 @@ DensTimings solveDensH(// Host input/output
     // One GPU, one state.  force_gpu_c picks up the same one.
     GpuState& s = gpuState();
 
-    const int ngas = static_cast<int>(x_host.size());
+    const int ngas = n;
     DensTimings t{};
     t.kernelMode = mode;
     t.nParticles = ngas;
@@ -715,10 +716,10 @@ DensTimings solveDensH(// Host input/output
     // -----------------------------------------------------------------------
     HIP_CHECK(hipEventRecord(evUpload0));
     s.ngas = ngas;
-    s.x.assign(x_host.begin(), x_host.end());
-    s.y.assign(y_host.begin(), y_host.end());
-    s.z.assign(z_host.begin(), z_host.end());
-    s.h.assign(h_host, h_host + x_host.size());
+    s.x.assign(x_host, x_host + ngas);
+    s.y.assign(y_host, y_host + ngas);
+    s.z.assign(z_host, z_host + ngas);
+    s.h.assign(h_host, h_host + ngas);
     s.rho.assign(ngas, 0.0);
     s.gradh.assign(ngas, 0.0);
     // Scratch lives in `s` and is resized, not reallocated, on each solve.

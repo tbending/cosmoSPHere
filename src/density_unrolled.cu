@@ -638,14 +638,15 @@ DensTimings solveDensH(// Host input/output
                         double* rho_host,
                         double* gradh_host,
                         // Host input (read-only)
-                        const std::vector<double>& x_host,
-                        const std::vector<double>& y_host,
-                        const std::vector<double>& z_host,
+                        const double* x_host,
+                        const double* y_host,
+                        const double* z_host,
+                        int n,
                         double pmass,
                         KernelMode mode,
                         const GradFields* grads)
 {
-    const int ngas = static_cast<int>(x_host.size());
+    const int ngas = n;
     DensTimings t{};
     t.kernelMode = mode;
 
@@ -668,8 +669,9 @@ DensTimings solveDensH(// Host input/output
     // Upload particle data to GPU
     // -----------------------------------------------------------------------
     HIP_CHECK(hipEventRecord(evUpload0));
-    thrust::device_vector<double> d_x(x_host), d_y(y_host), d_z(z_host);
-    thrust::device_vector<double> d_h(h_host, h_host + x_host.size());
+    thrust::device_vector<double> d_x(x_host, x_host + ngas), d_y(y_host, y_host + ngas),
+                                  d_z(z_host, z_host + ngas);
+    thrust::device_vector<double> d_h(h_host, h_host + ngas);
     thrust::device_vector<double> d_rho(ngas, 0.0), d_gradh(ngas, 0.0);
     thrust::device_vector<int>    d_converged(ngas, 0);
     HIP_CHECK(hipEventRecord(evUpload1));

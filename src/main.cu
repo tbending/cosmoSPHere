@@ -141,7 +141,7 @@ int main(int argc, char** argv)
         std::vector<double> rho_wu(ngas, 0.0), gradh_wu(ngas, 0.0);
         try {
             solveDensH(h_wu.data(), rho_wu.data(), gradh_wu.data(),
-                       pd.x, pd.y, pd.z,
+                       pd.x.data(), pd.y.data(), pd.z.data(), (int)pd.x.size(),
                        pd.pmass,
                        KernelMode::FLAT_PARTICLE);
         }
@@ -160,7 +160,7 @@ int main(int argc, char** argv)
     DensTimings timing;
     try {
         timing = solveDensH(pd.h.data(), rho.data(), gradh.data(),
-                             pd.x, pd.y, pd.z,
+                             pd.x.data(), pd.y.data(), pd.z.data(), (int)pd.x.size(),
                              pd.pmass,
                              KernelMode::FLAT_PARTICLE);
     }
@@ -195,7 +195,7 @@ int main(int argc, char** argv)
     DensTimings timing2;
     try {
         timing2 = solveDensH(pd.h.data(), rho.data(), gradh.data(),
-                              pd.x, pd.y, pd.z,
+                              pd.x.data(), pd.y.data(), pd.z.data(), (int)pd.x.size(),
                               pd.pmass,
                               KernelMode::WARP_PER_LEAF);
     }

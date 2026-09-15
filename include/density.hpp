@@ -75,7 +75,7 @@ struct GradFields
 
 // Solve for smoothing lengths h and densities rho for all particles.
 // h_host is in/out; rho_host and gradh_host are output-only.
-// x/y/z and pmass are read-only inputs.
+// x/y/z (n each) and pmass are read-only inputs.
 // mode selects the GPU density kernel (default: FLAT_PARTICLE).
 // grads is optional — see GradFields above.
 //
@@ -84,9 +84,10 @@ struct GradFields
 DensTimings solveDensH(double* h_host,
                        double* rho_host,
                        double* gradh_host,
-                       const std::vector<double>& x_host,
-                       const std::vector<double>& y_host,
-                       const std::vector<double>& z_host,
+                       const double* x_host,
+                       const double* y_host,
+                       const double* z_host,
+                       int n,
                        double pmass,
                        KernelMode mode = KernelMode::FLAT_PARTICLE,
                        const GradFields* grads = nullptr);

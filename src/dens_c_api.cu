@@ -1,10 +1,9 @@
 /*
  * dens_c_api.cu — C-linkage entry point for the Cornerstone GPU density solver.
  *
- * Phantom's Fortran code cannot call solveDensH() directly (x/y/z are
- * std::vector arguments).  This thin wrapper accepts flat C arrays, copies
- * the positions into vectors, and passes every other array straight through:
- * results are written into the caller's arrays by the device copies.
+ * C linkage for solveDensH().  Every array goes straight through: inputs are
+ * uploaded from the caller's arrays and results are written into them by the
+ * device copies, so nothing is staged here.
  *
  * Outputs (all arrays length n unless noted):
  *   h        — converged smoothing lengths (in/out, updated in-place)
@@ -64,18 +63,10 @@ extern "C" void densityiterate_gpu_c(
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
 
-    // h, rho and gradh_out go straight through: solveDensH reads h and writes all
-    // three into phantom's arrays, so there is nothing to stage or copy back.
-    const std::vector<double> x_vec(x, x + n);
-    const std::vector<double> y_vec(y, y + n);
-    const std::vector<double> z_vec(z, z + n);
-
-    // Velocities, accelerations and the gradient outputs go straight through as
-    // raw pointers — they are already flat arrays, so there is nothing to copy.
     GradFields grads{vx, vy, vz, ax, ay, az, divv, dvdx, ddivvdt};
 
     auto t1 = clk::now();
-    DensTimings t = solveDensH(h, rho, gradh_out, x_vec, y_vec, z_vec, pmass,
+    DensTimings t = solveDensH(h, rho, gradh_out, x, y, z, n, pmass,
                                KernelMode::FLAT_PARTICLE, &grads);
     auto t2 = clk::now();
 
