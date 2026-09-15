@@ -1,10 +1,10 @@
 /*
  * dens_c_api.cu — C-linkage entry point for the Cornerstone GPU density solver.
  *
- * Phantom's Fortran code cannot call solveDensH() directly (it takes
- * std::vector arguments).  This thin wrapper accepts flat C arrays,
- * copies them into the vectors solveDensH() expects, and writes back
- * the results.
+ * Phantom's Fortran code cannot call solveDensH() directly (x/y/z are
+ * std::vector arguments).  This thin wrapper accepts flat C arrays, copies
+ * the positions into vectors, and passes every other array straight through:
+ * results are written into the caller's arrays by the device copies.
  *
  * Outputs (all arrays length n unless noted):
  *   h        — converged smoothing lengths (in/out, updated in-place)
@@ -64,9 +64,8 @@ extern "C" void densityiterate_gpu_c(
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
 
-    std::vector<double> h_vec(h, h + n);
-    std::vector<double> rho_vec(n, 0.0);
-    std::vector<double> gradh_vec(n, 0.0);
+    // h, rho and gradh_out go straight through: solveDensH reads h and writes all
+    // three into phantom's arrays, so there is nothing to stage or copy back.
     const std::vector<double> x_vec(x, x + n);
     const std::vector<double> y_vec(y, y + n);
     const std::vector<double> z_vec(z, z + n);
@@ -76,16 +75,9 @@ extern "C" void densityiterate_gpu_c(
     GradFields grads{vx, vy, vz, ax, ay, az, divv, dvdx, ddivvdt};
 
     auto t1 = clk::now();
-    DensTimings t = solveDensH(h_vec, rho_vec, gradh_vec, x_vec, y_vec, z_vec, pmass,
+    DensTimings t = solveDensH(h, rho, gradh_out, x_vec, y_vec, z_vec, pmass,
                                KernelMode::FLAT_PARTICLE, &grads);
     auto t2 = clk::now();
-
-    for (int i = 0; i < n; ++i) {
-        h[i]         = h_vec[i];
-        rho[i]       = rho_vec[i];
-        gradh_out[i] = gradh_vec[i];
-    }
-    auto t3 = clk::now();
 
     // COSMO_MEM: one line per run with device memory in use and the host high-water
     // mark, taken after the first solve, so the largest problem that fits on a given
@@ -121,11 +113,11 @@ extern "C" void densityiterate_gpu_c(
             "COSMO_STATS n=%d leaves=%d iters=%d | vecin=%.2f upload=%.2f bbox=%.2f "
             "keysort=%.2f tree=%.2f nodes=%.2f jbuild=%.2f nrkern=%.2f gjbuild=%.2f "
             "gradkern=%.2f download=%.2f | gpusum=%.2f "
-            "solve=%.2f unaccounted=%.2f vecout=%.2f total=%.2f\n",
+            "solve=%.2f unaccounted=%.2f total=%.2f\n",
             t.nParticles, t.nLeavesOut, t.itersRun,
             ms(t0, t1), 1e3*t.upload, 1e3*t.bboxAndSetup, 1e3*t.keysAndSort,
             1e3*t.treeBuild, 1e3*t.nodeCenters, 1e3*t.jleafBuild, 1e3*t.densKernel,
             1e3*t.gradJleafBuild, 1e3*t.gradKernel, 1e3*t.download,
-            gpu, solve, solve - gpu, ms(t2, t3), ms(t0, t3));
+            gpu, solve, solve - gpu, ms(t0, t2));
     }
 }

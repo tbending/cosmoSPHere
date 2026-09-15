@@ -634,9 +634,9 @@ __global__ void sphDensityKernelLeafWarp(
 // ---------------------------------------------------------------------------
 
 DensTimings solveDensH(// Host input/output
-                        std::vector<double>& h_host,
-                        std::vector<double>& rho_host,
-                        std::vector<double>& gradh_host,
+                        double* h_host,
+                        double* rho_host,
+                        double* gradh_host,
                         // Host input (read-only)
                         const std::vector<double>& x_host,
                         const std::vector<double>& y_host,
@@ -669,7 +669,7 @@ DensTimings solveDensH(// Host input/output
     // -----------------------------------------------------------------------
     HIP_CHECK(hipEventRecord(evUpload0));
     thrust::device_vector<double> d_x(x_host), d_y(y_host), d_z(z_host);
-    thrust::device_vector<double> d_h(h_host);
+    thrust::device_vector<double> d_h(h_host, h_host + x_host.size());
     thrust::device_vector<double> d_rho(ngas, 0.0), d_gradh(ngas, 0.0);
     thrust::device_vector<int>    d_converged(ngas, 0);
     HIP_CHECK(hipEventRecord(evUpload1));
@@ -925,11 +925,11 @@ DensTimings solveDensH(// Host input/output
             {
                 thrust::device_vector<double> d_out(ngas);
                 thrust::scatter(d_h.begin(),    d_h.end(),    d_order.begin(), d_out.begin());
-                HIP_CHECK(hipMemcpy(h_host.data(),     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(h_host,     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
                 thrust::scatter(d_rho.begin(),  d_rho.end(),  d_order.begin(), d_out.begin());
-                HIP_CHECK(hipMemcpy(rho_host.data(),   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(rho_host,   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
                 thrust::scatter(d_gradh.begin(),d_gradh.end(),d_order.begin(), d_out.begin());
-                HIP_CHECK(hipMemcpy(gradh_host.data(), rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+                HIP_CHECK(hipMemcpy(gradh_host, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
             }
             HIP_CHECK(hipEventRecord(evDl1));
             checkGpuErrors(hipEventSynchronize(evDl1));

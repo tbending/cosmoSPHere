@@ -81,9 +81,9 @@ struct GradFields
 //
 // Leaves the tree, the Hilbert-sorted particle data and the leaf bookkeeping in the
 // shared state, so a repeated solve reuses the allocations — see gpu_state.hpp.
-DensTimings solveDensH(std::vector<double>& h_host,
-                       std::vector<double>& rho_host,
-                       std::vector<double>& gradh_host,
+DensTimings solveDensH(double* h_host,
+                       double* rho_host,
+                       double* gradh_host,
                        const std::vector<double>& x_host,
                        const std::vector<double>& y_host,
                        const std::vector<double>& z_host,

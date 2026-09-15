@@ -684,9 +684,9 @@ __global__ void scatterDvdxKernel(const double* __restrict__ in,
 // Host driver: build the tree, solve for h, then sweep the gradients.
 // ---------------------------------------------------------------------------
 DensTimings solveDensH(// Host input/output
-                        std::vector<double>& h_host,
-                        std::vector<double>& rho_host,
-                        std::vector<double>& gradh_host,
+                        double* h_host,
+                        double* rho_host,
+                        double* gradh_host,
                         // Host input (read-only)
                         const std::vector<double>& x_host,
                         const std::vector<double>& y_host,
@@ -717,7 +717,7 @@ DensTimings solveDensH(// Host input/output
     s.x.assign(x_host.begin(), x_host.end());
     s.y.assign(y_host.begin(), y_host.end());
     s.z.assign(z_host.begin(), z_host.end());
-    s.h.assign(h_host.begin(), h_host.end());
+    s.h.assign(h_host, h_host + x_host.size());
     s.rho.assign(ngas, 0.0);
     s.gradh.assign(ngas, 0.0);
     thrust::device_vector<int> d_converged(ngas, 0);
@@ -937,11 +937,11 @@ DensTimings solveDensH(// Host input/output
     {
         thrust::device_vector<double> d_out(ngas);
         thrust::scatter(s.h.begin(),     s.h.end(),     s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(h_host.data(),     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(h_host,     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         thrust::scatter(s.rho.begin(),   s.rho.end(),   s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(rho_host.data(),   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(rho_host,   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         thrust::scatter(s.gradh.begin(), s.gradh.end(), s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(gradh_host.data(), rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(gradh_host, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
 
         if (grads)
         {
