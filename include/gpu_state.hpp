@@ -58,9 +58,11 @@ struct GpuState
     thrust::device_vector<double> hmax_leaf, hmax_node;
 
     // ---- j-leaf lists ----
-    // Fixed stride: leaf L occupies jlist[L*MAX_J_PER_LEAF ... +jcount[L]).
+    // CSR: leaf L occupies jlist[jOffset[L] ... jOffset[L]+jcount[L]), and jOffset has
+    // nLeaves+1 entries, the last being the total.  See buildJLeafListsCSR.
     // Gather-only after the density solve; SYMMETRIC after buildForceJLeafList.
-    thrust::device_vector<int> jlist, jcount;
+    thrust::device_vector<int> jlist, jcount, jOffset;
+    thrust::device_vector<int> allLeaves;        // 0..nLeaves-1, for whole-tree list builds
     thrust::device_vector<int> overflow;         // [0] list truncations, [1] stack drops
 
     int ngas     = 0;

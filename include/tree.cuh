@@ -21,6 +21,8 @@
 #include <cstdint>
 
 #include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
+#include <thrust/scan.h>
 
 #include "util/annotation.hpp"
 #include "util/cuda_utils.hpp"
@@ -85,17 +87,16 @@ static __global__ void nodeFpCentersKernel(const uint64_t* __restrict__ prefixes
 // i-leaf.  All 64 lanes share the same j-leaf list → 64× cache reuse.
 // The 156 k DFS traversals needed to build the lists cost < 1 ms.
 //
-// Fixed-stride layout: jlist[iLeaf * MAX_J_PER_LEAF + k], k ∈ [0, jcount[iLeaf]).
-// Geometry: 2h ≈ 3e-3, leaf side ≈ 18e-3 → search sphere spans ≤ 3 leaf widths
-// → ≤ 27 j-leaves needed.  64 gives a comfortable 2.4× safety margin.
+// CSR layout: jlist[jOffset[iLeaf] + k], k ∈ [0, jcount[iLeaf]), built by
+// buildJLeafListsCSR below.  This used to be a fixed stride,
+// jlist[iLeaf * MAX_J_PER_LEAF + k], which could not be right in both directions:
+// 1024 was ~15x more than the median leaf needs, and still truncated SILENTLY on
+// strongly non-uniform fields (the torus reached 1494 j-leaves for one leaf).
+// Truncation under-counts neighbours -> rho too low -> Newton grows h further ->
+// runaway feedback.  Under CSR every leaf gets exactly the space it needs.
 // ---------------------------------------------------------------------------
-// Estimated max j-leaves per i-leaf: (2*(iHalf+leafHalf)/leafDiam)^3 ≈ 172
-// for max-jiggle h (3.56e-3). 256 was enough for near-uniform h, but when a
-// particle's h grows during Newton (rarefied/post-shock gas) the search sphere
-// can overlap far more leaves; silently truncating the list under-counts
-// neighbours -> rho too low -> Newton grows h further -> runaway feedback.
-// 1024 + overflow COUNTING (see d_overflow) instead of silent truncation.
-// Memory cost: nLeaves * 1024 * 4 = ~640 MB on 10M particles (fits A100/MI300).
+// MAX_J_PER_LEAF no longer sizes anything that is filled from the walk; it
+// remains only as the reference size quoted in diagnostics.
 static constexpr int MAX_J_PER_LEAF = 1024;
 // Reverse of internalToLeaf: leaf-CSL index → internal linked-tree node idx.
 // Needed to look up center/size of each i-leaf.
@@ -211,7 +212,8 @@ __global__ void buildJLeafListKernel(
     const TreeNodeIndex*  __restrict__ internalToLeaf,
     int              nActiveLeaves,
     const int*       __restrict__ activeLeaves,
-    int* __restrict__ jlist,
+    const int* __restrict__ jOffset,  // CSR offsets, nLeaves+1; unused when counting
+    int* __restrict__ jlist,          // nullptr: count only, into jcount
     int* __restrict__ jcount,
     int* __restrict__ overflow)   // [0] += jlist truncations, [1] += stack drops
 {
@@ -243,7 +245,12 @@ __global__ void buildJLeafListKernel(
     stack[0] = -1;
     int stackPos = 1;
     int count    = 0;
-    int jBase    = iLeaf * MAX_J_PER_LEAF;
+    // Two passes over the same tree.  Counting (jlist == nullptr) is the walk with the
+    // store removed -- `++count` below was always unconditional, only the store was
+    // capped.  Filling then writes into exactly the space the counts reserved.
+    const bool countOnly = (jlist == nullptr);
+    const int  jBase     = countOnly ? 0 : jOffset[iLeaf];
+    const int  cap       = countOnly ? 0 : jOffset[iLeaf + 1] - jOffset[iLeaf];
 
     // Check root overlap.
     if (!nodeInRange<Symmetric>(iCenter, iSize, iHalf, twoHi, hmax_node, 0, centers, sizes))
@@ -253,7 +260,7 @@ __global__ void buildJLeafListKernel(
     }
     if (childOffsets[0] == 0)  // root is itself a leaf
     {
-        if (count < MAX_J_PER_LEAF) jlist[jBase + count] = internalToLeaf[0];
+        if (!countOnly && cap > 0) jlist[jBase] = internalToLeaf[0];
         jcount[iLeaf] = 1;
         return;
     }
@@ -268,7 +275,7 @@ __global__ void buildJLeafListKernel(
                 continue;
             if (childOffsets[child] == 0)
             {
-                if (count < MAX_J_PER_LEAF)
+                if (!countOnly && count < cap)
                     jlist[jBase + count] = internalToLeaf[child];
                 ++count;
             }
@@ -281,8 +288,46 @@ __global__ void buildJLeafListKernel(
         node = stack[--stackPos];
     } while (node != -1);
 
-    if (count > MAX_J_PER_LEAF) atomicAdd(&overflow[0], count - MAX_J_PER_LEAF);
-    jcount[iLeaf] = min(count, MAX_J_PER_LEAF);
+    // With exact offsets this can only fire if the tree changed between the two
+    // passes -- a real bug, so it stays loud rather than silently truncating.
+    if (!countOnly && count > cap) atomicAdd(&overflow[0], count - cap);
+    jcount[iLeaf] = countOnly ? count : min(count, cap);
+}
+
+/*! @brief Build the j-leaf lists of ALL leaves in CSR form: count, scan, size, fill.
+ *
+ * All leaves rather than only the active ones, because an offset moves as soon as
+ * any count below it changes, so a subset cannot be rebuilt in place.  The walk is
+ * cheap; the saving is that s.jlist is exactly sum(jcount) long and can never
+ * truncate.  hmax_node is nullptr for the gather (density) lists.
+ */
+template<bool Symmetric>
+inline void buildJLeafListsCSR(GpuState& s, const double* hmax_node)
+{
+    const int nL = s.nLeaves;
+    s.jcount.resize(nL);
+    s.jOffset.resize(nL + 1);
+
+    auto walk = [&](const int* jOffset, int* jlist) {
+        buildJLeafListKernel<Symmetric><<<iceil(nL, 256), 256>>>(
+            rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), hmax_node,
+            rawPtr(s.centers), rawPtr(s.sizes),
+            rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
+            nL, rawPtr(s.allLeaves),
+            jOffset, jlist, rawPtr(s.jcount), rawPtr(s.overflow));
+        checkGpuErrors(cudaGetLastError());
+    };
+
+    walk(nullptr, nullptr);                         // pass 1: counts
+
+    // jOffset[0] = 0, jOffset[k] = sum of counts below k, jOffset[nL] = total
+    s.jOffset[0] = 0;
+    thrust::inclusive_scan(thrust::device, s.jcount.begin(), s.jcount.end(),
+                           s.jOffset.begin() + 1);
+    const int total = s.jOffset[nL];                // the one host read per build
+    s.jlist.resize(total > 0 ? total : 1);
+
+    walk(rawPtr(s.jOffset), rawPtr(s.jlist));       // pass 2: fill
 }
 
 //! @brief Per-phase cost of one tree build, in seconds.
@@ -298,7 +343,7 @@ struct TreeTimings
  *
  * Sorts s.x/y/z/h into Hilbert order (and anything in @p alsoSort alongside them),
  * fills s.order, s.octree, s.box, s.centers, s.sizes, s.leafToInternal, s.layout,
- * s.particleLeaf, s.nLeaves and s.numNodes, and sizes s.jlist/s.jcount/s.hmax_leaf.
+ * s.particleLeaf, s.nLeaves and s.numNodes, and sizes s.jcount/s.jOffset/s.hmax_leaf.
  *
  * Allocations are reused across calls; the tree contents are rebuilt every time,
  * because the particles have moved.

@@ -52,13 +52,13 @@ struct ForceFields
  * Requires s.hmax_leaf valid for EVERY leaf at the converged h — the full-tree pass
  * at the top of solveDensH's gradient sweep leaves it that way.  Propagates it to
  * every node (hmax cannot be derived from an SFC key the way node geometry can) and
- * overwrites s.jlist / s.jcount.
+ * overwrites s.jlist / s.jcount / s.jOffset.
  *
  * Measured on sedov (176900 particles, 41 dumps to t=0.1): 0% larger than the gather
  * list at uniform ICs, ~7% once the blast develops, peaking at 8.3%.  It stays small
  * because leaf size and h are both set by local density, so 2h is ~1 leaf width
- * everywhere and a big-h leaf is also a big leaf.  Longest list seen: 433 against
- * MAX_J_PER_LEAF = 1024.
+ * everywhere and a big-h leaf is also a big leaf.  Longest list seen on sedov: 433
+ * j-leaves; the torus reached 1494.
  */
 void buildForceJLeafList(GpuState& s, ForceTimings& ft);
 

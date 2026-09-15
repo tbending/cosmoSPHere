@@ -68,17 +68,7 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
     // of 2*hmax_i, tested as a Euclidean distance between the raw boxes rather than
     // inflate-and-overlap.  Overwrites the gather lists.
     // -----------------------------------------------------------------------
-    thrust::device_vector<int> d_allLeaves(s.nLeaves);
-    thrust::sequence(d_allLeaves.begin(), d_allLeaves.end());
-
-    buildJLeafListKernel<true><<<iceil(s.nLeaves, 256), 256>>>(
-        rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), rawPtr(s.hmax_node),
-        rawPtr(s.centers), rawPtr(s.sizes),
-        rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
-        s.nLeaves, rawPtr(d_allLeaves),
-        rawPtr(s.jlist), rawPtr(s.jcount),
-        rawPtr(s.overflow));
-    checkGpuErrors(cudaGetLastError());
+    buildJLeafListsCSR<true>(s, rawPtr(s.hmax_node));
 
     HIP_CHECK(hipEventRecord(e2));
     checkGpuErrors(hipEventSynchronize(e2));
@@ -89,8 +79,8 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
 
     s.jlistToken = s.token;
 
-    // The symmetric radius makes the lists longer, so a truncation that never fired
-    // for gather could fire here.  Silent truncation loses neighbours — make it loud.
+    // Under CSR a list cannot truncate, and the stack can only drop subtrees on a
+    // pathological tree; either would lose neighbours silently, so make it loud.
     int ovf[2] = {0, 0};
     HIP_CHECK(hipMemcpy(ovf, rawPtr(s.overflow), 2*sizeof(int), hipMemcpyDeviceToHost));
     if (ovf[0] > 0 || ovf[1] > 0)
@@ -125,6 +115,7 @@ __global__ void sphForceKernelJList(
     double beta,
     double alphau,
     const int* __restrict__ particleLeaf,
+    const int* __restrict__ jOffset,
     const int* __restrict__ jcount,
     const int* __restrict__ jlist,
     const unsigned* __restrict__ layout)
@@ -180,7 +171,7 @@ __global__ void sphForceKernelJList(
     double divv_s    = 0.0;
 
     const int iLeaf = particleLeaf[i];
-    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     const int nj    = jcount[iLeaf];
 
     for (int jl = 0; jl < nj; ++jl)
@@ -355,7 +346,8 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
         rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
         rawPtr(d_vsigmax), rawPtr(d_divv),
         n, pmass, beta, alphau,
-        rawPtr(s.particleLeaf), rawPtr(s.jcount), rawPtr(s.jlist), rawPtr(s.layout));
+        rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+        rawPtr(s.layout));
     checkGpuErrors(cudaGetLastError());
     HIP_CHECK(hipEventRecord(e2));
     HIP_CHECK(hipDeviceSynchronize());

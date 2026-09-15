@@ -143,9 +143,12 @@ void buildTree(GpuState& s,
     checkGpuErrors(cudaGetLastError());
 
     // Storage for the walk. Reused across calls; every entry is written before use.
+    // jlist itself is sized by buildJLeafListsCSR, from the counts.
     s.hmax_leaf.resize(s.nLeaves);
-    s.jlist.resize((size_t)s.nLeaves * MAX_J_PER_LEAF);
     s.jcount.resize(s.nLeaves);
+    s.jOffset.resize(s.nLeaves + 1);
+    s.allLeaves.resize(s.nLeaves);
+    thrust::sequence(s.allLeaves.begin(), s.allLeaves.end());
     s.overflow.assign(2, 0);
     HIP_CHECK(hipEventRecord(e4));
     checkGpuErrors(hipEventSynchronize(e4));

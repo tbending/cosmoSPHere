@@ -242,6 +242,7 @@ __global__ void sphDensityKernelJList(
     const int*    __restrict__ activeParticles,
     double        pmass,
     const int*       __restrict__ particleLeaf,
+    const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout)
@@ -258,7 +259,7 @@ __global__ void sphDensityKernelJList(
     double gradhi = 0.0;
 
     const int iLeaf = particleLeaf[i];
-    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     const int nj    = jcount[iLeaf];
 
     for (int jl = 0; jl < nj; ++jl)
@@ -364,25 +365,29 @@ __global__ void sphDensityKernelLeafWarp(
     int           nActiveLeaves,
     const int*    __restrict__ activeLeaves,
     double        pmass,
+    const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout)
 {
-    // Shared memory caches the complete j-leaf list for this i-leaf.
-    // Cost: MAX_J_PER_LEAF * 4 = 1 KB per block — allows high SM occupancy.
-    __shared__ int sJList[MAX_J_PER_LEAF];
+    // Shared memory caches the j-leaf list for this i-leaf.  Under CSR a leaf's count
+    // is unbounded (the torus reached 1494), so the cache is a fixed tile and any
+    // entries beyond it are read from global memory.  256 covers p90 (~136) with room.
+    constexpr int SJTILE = 256;
+    __shared__ int sJList[SJTILE];
 
     int iLeafIdx = blockIdx.x;
     if (iLeafIdx >= nActiveLeaves) return;
     int iLeaf = activeLeaves[iLeafIdx];
 
     int lane  = threadIdx.x;           // 0 .. BUCKET_SIZE-1
-    int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     int nj    = jcount[iLeaf];
 
     // Cooperatively load j-leaf list into shared memory.
     // All lanes participate so the load is coalesced.
-    for (int k = lane; k < nj; k += blockDim.x)
+    const int nCached = nj < SJTILE ? nj : SJTILE;
+    for (int k = lane; k < nCached; k += blockDim.x)
         sJList[k] = jlist[jBase + k];
     __syncthreads();
 
@@ -403,7 +408,7 @@ __global__ void sphDensityKernelLeafWarp(
 
     for (int jl = 0; jl < nj; ++jl)
     {
-        unsigned jLeaf = (unsigned)sJList[jl];
+        unsigned jLeaf = (unsigned)(jl < SJTILE ? sJList[jl] : jlist[jBase + jl]);
         for (unsigned j = layout[jLeaf]; j < layout[jLeaf + 1]; ++j)
         {
             double dx   = xi - x[j];
@@ -497,6 +502,7 @@ __global__ void sphGradientsKernel(
     int           ngas,
     double        pmass,
     const int*       __restrict__ particleLeaf,
+    const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout)
@@ -517,7 +523,7 @@ __global__ void sphGradientsKernel(
     double rxx = 0.0, rxy = 0.0, rxz = 0.0, ryy = 0.0, ryz = 0.0, rzz = 0.0;
 
     const int iLeaf = particleLeaf[i];
-    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     const int nj    = jcount[iLeaf];
 
     for (int jl = 0; jl < nj; ++jl)
@@ -751,7 +757,7 @@ DensTimings solveDensH(// Host input/output
 
     // -----------------------------------------------------------------------
     // Newton iteration.  Each pass:
-    //   a) rebuild hmax + gather j-leaf list, for the active leaves only
+    //   a) refresh hmax for the active leaves, rebuild the gather j-leaf lists
     //   b) one density kernel over the active particles
     //   c) compact the active sets to whatever is still unconverged
     //
@@ -772,14 +778,10 @@ DensTimings solveDensH(// Host input/output
                 rawPtr(s.hmax_leaf));
             checkGpuErrors(cudaGetLastError());
 
-            buildJLeafListKernel<false><<<iceil(nActiveLeaves, 256), 256>>>(
-                rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), nullptr,
-                rawPtr(s.centers), rawPtr(s.sizes),
-                rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
-                nActiveLeaves, rawPtr(d_activeLeaves),
-                rawPtr(s.jlist), rawPtr(s.jcount),
-                rawPtr(s.overflow));
-            checkGpuErrors(cudaGetLastError());
+            // hmax has just been refreshed for the leaves still iterating; the lists
+            // are rebuilt for ALL leaves, because CSR offsets shift as soon as any
+            // count changes.  Lists of converged leaves are built but not read.
+            buildJLeafListsCSR<false>(s, nullptr);
             HIP_CHECK(hipEventRecord(evJB1));
 
             if (mode == KernelMode::WARP_PER_LEAF)
@@ -789,7 +791,7 @@ DensTimings solveDensH(// Host input/output
                     rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
                     nActiveLeaves, rawPtr(d_activeLeaves),
                     pmass,
-                    rawPtr(s.jcount), rawPtr(s.jlist),
+                    rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
                     rawPtr(s.layout));
             }
             else
@@ -800,7 +802,7 @@ DensTimings solveDensH(// Host input/output
                     nActive, rawPtr(d_activeParticles),
                     pmass,
                     rawPtr(s.particleLeaf),
-                    rawPtr(s.jcount), rawPtr(s.jlist),
+                    rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
                     rawPtr(s.layout));
             }
             checkGpuErrors(cudaGetLastError());
@@ -892,14 +894,7 @@ DensTimings solveDensH(// Host input/output
             rawPtr(s.hmax_leaf));
         checkGpuErrors(cudaGetLastError());
 
-        buildJLeafListKernel<false><<<iceil(nActiveLeaves, 256), 256>>>(
-            rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), nullptr,
-            rawPtr(s.centers), rawPtr(s.sizes),
-            rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
-            nActiveLeaves, rawPtr(d_activeLeaves),
-            rawPtr(s.jlist), rawPtr(s.jcount),
-            rawPtr(s.overflow));
-        checkGpuErrors(cudaGetLastError());
+        buildJLeafListsCSR<false>(s, nullptr);
         HIP_CHECK(hipEventRecord(evGJ));
 
         sphGradientsKernel<<<iceil(ngas, 256), 256>>>(
@@ -910,7 +905,7 @@ DensTimings solveDensH(// Host input/output
             rawPtr(d_divv), rawPtr(d_dvdx), rawPtr(d_ddivvdt),
             ngas, pmass,
             rawPtr(s.particleLeaf),
-            rawPtr(s.jcount), rawPtr(s.jlist),
+            rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
             rawPtr(s.layout));
         checkGpuErrors(cudaGetLastError());
 
