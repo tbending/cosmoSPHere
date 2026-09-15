@@ -3,8 +3,8 @@
  *
  * Mirrors phantom's structure: densityiterate and force are two separate calls
  * (deriv.F90 :139 and :195), so this is its own entry point.  It rebuilds no tree:
- * the Hilbert ordering, gradh and the leaf bookkeeping were left in gpuState() by
- * densityiterate_gpu_c.  The work is done by computeForces (force.cu).
+ * the Hilbert ordering, positions, h, gradh and the leaf bookkeeping were left in
+ * gpuState() by densityiterate_gpu_c.  The work is done by computeForces (force.cu).
  *
  * PARTICLE ORDERING — read before adding an argument (applies in computeForces).
  * Phantom's arrays are in phantom's order; everything in the state is Hilbert-sorted.
@@ -26,10 +26,6 @@
 extern "C" void force_gpu_c(
     int n,
     double pmass,
-    const double* x,
-    const double* y,
-    const double* z,
-    const double* h,
     const double* vx,
     const double* vy,
     const double* vz,
@@ -61,7 +57,7 @@ extern "C" void force_gpu_c(
         std::abort();
     }
 
-    ForceFields f{x, y, z, h, vx, vy, vz, pro2, spsound, alphaAV, u,
+    ForceFields f{vx, vy, vz, pro2, spsound, alphaAV, u,
                   fx, fy, fz, f4, vsigmax, divv};
     ForceTimings ft;
     computeForces(s, f, pmass, beta, alphau, ft);

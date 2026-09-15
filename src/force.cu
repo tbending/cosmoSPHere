@@ -326,9 +326,20 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
         thrust::gather(s.order.begin(), s.order.end(), phantomOrder.begin(), sorted.begin());
         return sorted;
     };
-    thrust::device_vector<double> d_x  = upload(f.x),  d_y  = upload(f.y),  d_z  = upload(f.z);
-    thrust::device_vector<double> d_h  = upload(f.h);
-    thrust::device_vector<double> d_vx = upload(f.vx), d_vy = upload(f.vy), d_vz = upload(f.vz);
+    // Positions and h: the solve's Hilbert-sorted copies are exactly what phantom holds
+    // -- the positions it uploaded and the converged h it stored back -- and phantom
+    // only calls force again on the same tree when positions have not moved.
+    // Velocities: the solve's copies serve the first force pass after it; a later one is
+    // the corrector, with new velocities (see GpuState::forceToken).
+    const bool refreshV = (s.forceToken == s.token) || (int)s.vx.size() != n;
+    if (refreshV)
+    {
+        s.vx = upload(f.vx);
+        s.vy = upload(f.vy);
+        s.vz = upload(f.vz);
+    }
+    s.forceToken = s.token;
+
     thrust::device_vector<double> d_pro2    = upload(f.pro2);
     thrust::device_vector<double> d_spsound = upload(f.spsound);
     thrust::device_vector<double> d_alphaAV = upload(f.alphaAV);
@@ -339,9 +350,9 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     HIP_CHECK(hipEventRecord(e1));
 
     sphForceKernelJList<<<iceil(n, 256), 256>>>(
-        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
-        rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
-        rawPtr(d_h), rawPtr(s.gradh),
+        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+        rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
+        rawPtr(s.h), rawPtr(s.gradh),
         rawPtr(d_pro2), rawPtr(d_spsound), rawPtr(d_alphaAV), rawPtr(d_u),
         rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
         rawPtr(d_vsigmax), rawPtr(d_divv),

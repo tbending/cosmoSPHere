@@ -82,6 +82,12 @@ struct GpuState
     // bumps token, so a mismatch is exactly "needs rebuild" — nothing to invalidate.
     uint64_t jlistToken = 0;
 
+    // The token of the last force pass.  The first force pass after a solve can use
+    // the velocities the solve uploaded -- derivs passes the same array to both --
+    // but a later pass on the same tree is the leapfrog corrector, whose velocities
+    // have changed, so it uploads them again.
+    uint64_t forceToken = 0;
+
     bool readyForForce(int n) const { return ngas == n && token != 0; }
 };
 

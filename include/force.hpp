@@ -26,11 +26,11 @@ struct ForceTimings
 
 // Host arrays for one force pass, in phantom order, all length n.  Raw pointers rather
 // than std::vector, as for GradFields: they come straight from Fortran through the C API.
+// Positions and h are not here: the force pass uses the solve's copies in GpuState.
 struct ForceFields
 {
     // inputs
-    const double* x;  const double* y;  const double* z;  const double* h;
-    const double* vx; const double* vy; const double* vz;
+    const double* vx; const double* vy; const double* vz;   // read on the corrector only
     const double* pro2;      // P / rho^2
     const double* spsound;   // sound speed
     const double* alphaAV;   // artificial viscosity alpha
@@ -67,8 +67,10 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft);
  *
  * Rebuilds the symmetric j-leaf lists if the tree has changed, uploads the inputs and
  * gathers them into Hilbert order, runs the force kernel, and scatters the outputs back
- * to phantom order.  Requires a density solve for the same particle set
- * (GpuState::readyForForce).
+ * to phantom order.  Positions and h are taken from the solve's copies in the state, and
+ * velocities uploaded only when they may have changed since the solve.  Requires a
+ * density solve for the same particle set (GpuState::readyForForce), with positions not
+ * moved since it.
  */
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
                    double alphau, ForceTimings& ft);
