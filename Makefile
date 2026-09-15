@@ -75,8 +75,11 @@ all: $(BUILDDIR)/density_hip $(BUILDDIR)/density_hip_unrolled
 # ---------------------------------------------------------------------------
 lib: $(BUILDDIR)/libcosmoSPHere.a
 
-$(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/tree.o $(BUILDDIR)/force.o $(BUILDDIR)/gpu_state.o $(BUILDDIR)/dens_c_api.o $(BUILDDIR)/force_c_api.o
+$(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/tree.o $(BUILDDIR)/force.o $(BUILDDIR)/gpu_state.o $(BUILDDIR)/dens_c_api.o $(BUILDDIR)/force_c_api.o $(BUILDDIR)/pin_c_api.o
 	ar rcs $@ $^
+
+$(BUILDDIR)/pin_c_api.o: src/pin_c_api.cu $(TAGFILE)
+	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/pin_c_api.d -c -o $@ $<
 
 $(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/dens_c_api.d -c -o $@ $<
