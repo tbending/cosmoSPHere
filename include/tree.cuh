@@ -43,6 +43,7 @@
 
 #include "gpu_check.hpp"
 #include "gpu_state.hpp"
+#include "kernel.hpp"
 
 using namespace cstone;
 
@@ -217,8 +218,8 @@ static __global__ void hmaxUpsweepKernel(TreeNodeIndex first,
 
 /*! @brief Can node @p node hold a particle interacting with one in the i-leaf?
  *
- * Symmetric=false (density): radius 2*hmax_i, applied by inflating the i-box.
- * Symmetric=true  (force):   radius 2*max(hmax_i, hmax_node).  Depends on the
+ * Symmetric=false (density): radius radkernel*hmax_i, applied by inflating the i-box.
+ * Symmetric=true  (force):   radius radkernel*max(hmax_i, hmax_node).  Depends on the
  *     candidate, so the i-box cannot be pre-inflated; tested as a Euclidean distance
  *     between the raw boxes, which is tighter than inflate-and-overlap and costs the
  *     same.
@@ -228,7 +229,7 @@ template<bool Symmetric, bool Periodic>
 __device__ inline bool nodeInRange(const Vec3<double>& iCenter,
                                    const Vec3<double>& iSize,
                                    const Vec3<double>& iHalf,
-                                   double              twoHi,
+                                   double              radHi,
                                    const double* __restrict__ hmax_node,
                                    TreeNodeIndex node,
                                    const Vec3<double>* __restrict__ centers,
@@ -241,7 +242,7 @@ __device__ inline bool nodeInRange(const Vec3<double>& iCenter,
                                     : minDistance(iCenter, aSize, centers[node], sizes[node]);
     if constexpr (Symmetric)
     {
-        const double rs = fmax(twoHi, 2.0 * hmax_node[node]);
+        const double rs = fmax(radHi, sph::radkernel * hmax_node[node]);
         return norm2(d) <= rs * rs;
     }
     else
@@ -282,12 +283,12 @@ __global__ void buildJLeafListKernel(
     // Guard: if all h in this leaf were non-finite, hmax==0 → use iSize only
     // (no real neighbours needed; density kernel will guard the update too).
     if (!isfinite(hmax) || hmax <= 0.0) hmax = 0.0;
-    const double twoHi = 2.0 * hmax;
-    // Gather only: the i-leaf's box expanded by 2·hmax.  The symmetric radius depends
+    const double radHi = sph::radkernel * hmax;   // kernel support of the i-leaf
+    // Gather only: the i-leaf's box expanded by radkernel·hmax.  The symmetric radius depends
     // on the candidate node, so that path cannot pre-inflate and leaves this unused.
-    Vec3<double> iHalf{ iSize[0] + twoHi,
-                        iSize[1] + twoHi,
-                        iSize[2] + twoHi };
+    Vec3<double> iHalf{ iSize[0] + radHi,
+                        iSize[1] + radHi,
+                        iSize[2] + radHi };
 
     // DFS traversal.  The old bound (7 x tree_depth ~ 32) assumed a NARROW
     // search sphere; once hmax grows the sphere overlaps many subtrees and the
@@ -307,7 +308,7 @@ __global__ void buildJLeafListKernel(
     const int  cap       = countOnly ? 0 : jOffset[iLeaf + 1] - jOffset[iLeaf];
 
     // Check root overlap.
-    if (!nodeInRange<Symmetric, Periodic>(iCenter, iSize, iHalf, twoHi, hmax_node, 0,
+    if (!nodeInRange<Symmetric, Periodic>(iCenter, iSize, iHalf, radHi, hmax_node, 0,
                                           centers, sizes, box))
     {
         jcount[iLeaf] = 0;
@@ -325,7 +326,7 @@ __global__ void buildJLeafListKernel(
         for (int oct = 0; oct < 8; ++oct)
         {
             TreeNodeIndex child = childOffsets[node] + oct;
-            if (!nodeInRange<Symmetric, Periodic>(iCenter, iSize, iHalf, twoHi, hmax_node,
+            if (!nodeInRange<Symmetric, Periodic>(iCenter, iSize, iHalf, radHi, hmax_node,
                                                   child, centers, sizes, box))
                 continue;
             if (childOffsets[child] == 0)

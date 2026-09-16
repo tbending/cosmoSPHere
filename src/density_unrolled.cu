@@ -47,6 +47,10 @@
 
 #include "kernel.hpp"
 
+#ifdef COSMO_KERNEL_QUINTIC
+#error "density_unrolled.cu is a cubic-spline benchmark; build it with KERNEL=cubic"
+#endif
+
 using namespace cstone;
 
 // Maximum particles per octree leaf node.
@@ -228,7 +232,7 @@ __global__ void sphDensityKernel(const double* __restrict__ x,
     const double rho_i  = rhoi  * sph::cnormk * pmass * hi31;
     const double grad_i = gradhi * sph::cnormk * pmass * hi41;
 
-    const double funci   = pmass * (sph::hfact * hi1) * (sph::hfact * hi1) * (sph::hfact * hi1) - rho_i;
+    const double funci   = pmass * (sph::hfact_default * hi1) * (sph::hfact_default * hi1) * (sph::hfact_default * hi1) - rho_i;
     const double dhdrhoi = -hi / (3.0 * rho_i);
     // omega must use the NORMALISED grad_i (= d(rho)/d(h)), matching Fortran:
     //   gradhi = gradh(i) * cnormk * pmass * hi41
@@ -495,7 +499,7 @@ __global__ void sphDensityKernelJList(
         return;
     }
 
-    const double funci   = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1) - rho_i;
+    const double funci   = pmass * (sph::hfact_default*hi1) * (sph::hfact_default*hi1) * (sph::hfact_default*hi1) - rho_i;
     const double dhdrhoi = -hi / (3.0 * rho_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
     const double omegai  = 1.0 - dhdrhoi * grad_i;
@@ -619,7 +623,7 @@ __global__ void sphDensityKernelLeafWarp(
         return;
     }
 
-    const double funci   = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1) - rho_i;
+    const double funci   = pmass * (sph::hfact_default*hi1) * (sph::hfact_default*hi1) * (sph::hfact_default*hi1) - rho_i;
     const double dhdrhoi = -hi / (3.0 * rho_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
     const double omegai  = 1.0 - dhdrhoi * grad_i;
@@ -646,7 +650,8 @@ DensTimings solveDensH(// Host input/output
                         KernelMode mode,
                         const GradFields* grads,
                         const double* periodicBox,
-                        double /* tolh: this variant keeps its own HTOL */)
+                        double /* tolh: this variant keeps its own HTOL */,
+                        double /* hfact: cubic, hfact_default */)
 {
     const int ngas = n;
     DensTimings t{};

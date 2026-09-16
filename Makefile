@@ -26,14 +26,24 @@ $(shell mkdir -p $(BUILDDIR))
 # wrong-backend objects (and then fails to link, e.g. cuda .o linked with -lamdhip64).
 # Stamp the active config into a file, rewriting it ONLY when it changes so its mtime
 # bumps and the objects below (which list $(TAGFILE) as a prerequisite) recompile.
-BUILD_TAG := $(GPU_BACKEND) $(CUDA_ARCH) $(HIP_ARCH)
+# Smoothing kernel, as phantom's KERNEL: cubic (default) or quintic.  Part of the build
+# tag, so switching kernel recompiles everything.
+KERNEL ?= cubic
+ifeq ($(KERNEL),quintic)
+    KERNEL_FLAGS := -DCOSMO_KERNEL_QUINTIC
+else ifeq ($(KERNEL),cubic)
+    KERNEL_FLAGS :=
+else
+    $(error KERNEL=$(KERNEL) is not implemented in cosmoSPHere -- use cubic or quintic)
+endif
+BUILD_TAG := $(GPU_BACKEND) $(CUDA_ARCH) $(HIP_ARCH) $(KERNEL)
 TAGFILE   := $(BUILDDIR)/.build_tag
 $(shell [ "$$(cat $(TAGFILE) 2>/dev/null)" = "$(BUILD_TAG)" ] || printf '%s' "$(BUILD_TAG)" > $(TAGFILE))
 
 # ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
-INCLUDES := -Iinclude -I$(CORNERSTONE_DIR)
+INCLUDES := -Iinclude -I$(CORNERSTONE_DIR) $(KERNEL_FLAGS)
 
 ifeq ($(GPU_BACKEND),cuda)
     # Native CUDA build (nvcc). The sources use HIP names; hip_to_cuda.h is

@@ -64,8 +64,8 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
 
     // -----------------------------------------------------------------------
     // The walk, over every leaf.  Identical traversal to the density one; the only
-    // difference is that the accept radius becomes 2*max(hmax_i, hmax_node) instead
-    // of 2*hmax_i, tested as a Euclidean distance between the raw boxes rather than
+    // difference is that the accept radius becomes radkernel*max(hmax_i, hmax_node) instead
+    // of radkernel*hmax_i, tested as a Euclidean distance between the raw boxes rather than
     // inflate-and-overlap.  Overwrites the gather lists.
     // -----------------------------------------------------------------------
     buildJLeafListsCSR<true>(s, rawPtr(s.hmax_node));
@@ -105,7 +105,8 @@ __global__ void forcePrepKernel(
     double* __restrict__ divfac,   // factor turning the div v sum into div v
     int n,
     double pmass,
-    double alphau)
+    double alphau,
+    double hfact)             // rho = pmass (hfact/h)^3, as the density solve used
 {
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) return;
@@ -119,7 +120,7 @@ __global__ void forcePrepKernel(
     }
     const double h_sq_inv = 1.0 / (hi * hi);
     const double h_4_inv  = h_sq_inv * h_sq_inv;
-    const double hfoh     = sph::hfact / hi;
+    const double hfoh     = hfact / hi;
     const double rho      = pmass * hfoh * hfoh * hfoh;
     const double dhdrho   = -hi / (3.0 * rho);
     const double omega    = 1.0 - dhdrho * gradh[i];
@@ -178,7 +179,8 @@ __global__ void sphForceKernelJList(
     const int* __restrict__ jcount,
     const int* __restrict__ jlist,
     const unsigned* __restrict__ layout,
-    Box<double> box)
+    Box<double> box,
+    double hfact)             // rho = pmass (hfact/h)^3, as the density solve used
 {
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) return;
@@ -314,7 +316,7 @@ __global__ void sphForceKernelJList(
 
                 double wij, grwij;
                 const double qij = dr * hinv[i];
-                sph::m4_kern(qij, wij, grwij);
+                sph::kern(qij2, qij, wij, grwij);
 
                 // div v: projv is already (v_i - v_j) . r_ij / |r_ij|
                 divv_s += pmass * grwij * projv;
@@ -354,7 +356,7 @@ __global__ void sphForceKernelJList(
 
                 double wj_ij, grwj_ij;
                 const double qj_ij = dr * hinv[j];
-                sph::m4_kern(qj_ij, wj_ij, grwj_ij);
+                sph::kern(qj_ij2, qj_ij, wj_ij, grwj_ij);
 
                 double gradkernj   = grwj_ij * grkfac[j];   // F_ij(h_j) / omega_j
 
@@ -434,7 +436,7 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
         rawPtr(s.h), rawPtr(s.gradh), rawPtr(s.pro2),
         rawPtr(s.hsqinv), rawPtr(s.hinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
         rawPtr(s.pres), rawPtr(s.auterm), rawPtr(s.divfac),
-        n, pmass, alphau);
+        n, pmass, alphau, s.hfact);
     checkGpuErrors(cudaGetLastError());
 
     // Periodic or not is whatever the density solve built this tree with.
@@ -453,7 +455,7 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
                 rawPtr(s.vsigmax), rawPtr(s.divvF),
                 n, pmass, beta, pdvHeating, shockHeating,
                 rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-                rawPtr(s.layout), s.box);
+                rawPtr(s.layout), s.box, s.hfact);
         };
         if (fullHeating) run(std::true_type{});
         else             run(std::false_type{});
