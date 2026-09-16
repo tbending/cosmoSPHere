@@ -81,6 +81,7 @@ struct GpuState
     thrust::device_vector<double> fStage;        // one array in phantom order, either direction
 
     int ngas     = 0;
+    double hfact = 0.0;   // h-rho relation of the last density solve, for the force pass
     // Live particles (h > 0) form the prefix [0, nAlive) of the Hilbert order; dead
     // ones sit after it, belong to no leaf, never enter a j-list, and keep the values
     // phantom gave them (in particular their negative h).
