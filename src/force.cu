@@ -96,6 +96,7 @@ __global__ void forcePrepKernel(
     const double* __restrict__ gradh,
     const double* __restrict__ pro2,
     double* __restrict__ hsqinv,   // 1/h^2
+    double* __restrict__ hinv,     // 1/h
     double* __restrict__ rhoh,     // rho(h), as phantom's rhoh, not the summed density
     double* __restrict__ rho1,     // 1/rho
     double* __restrict__ grkfac,   // cnormk h^-4 / Omega: grad W's factor, F_ij(h)/Omega
@@ -112,7 +113,7 @@ __global__ void forcePrepKernel(
     const double hi = h[i];
     if (!(hi > 0.0))   // dead: never a neighbour, and its own force is set to zero
     {
-        hsqinv[i] = 0.0; rhoh[i] = 0.0; rho1[i] = 0.0; grkfac[i] = 0.0;
+        hsqinv[i] = 0.0; hinv[i] = 0.0; rhoh[i] = 0.0; rho1[i] = 0.0; grkfac[i] = 0.0;
         pres[i] = 0.0; auterm[i] = 0.0; divfac[i] = 0.0;
         return;
     }
@@ -125,6 +126,7 @@ __global__ void forcePrepKernel(
     const double omega_inv = 1 / omega;
 
     hsqinv[i] = h_sq_inv;
+    hinv[i]   = 1.0 / hi;
     rhoh[i]   = rho;
     rho1[i]   = 1.0 / rho;
     grkfac[i] = h_4_inv * sph::cnormk * omega_inv;
@@ -153,6 +155,7 @@ __global__ void sphForceKernelJList(
     const double* __restrict__ alphaAV,
     const double* __restrict__ u,
     const double* __restrict__ hsqinv,
+    const double* __restrict__ hinv,
     const double* __restrict__ rhoh,
     const double* __restrict__ rho1,
     const double* __restrict__ grkfac,
@@ -246,10 +249,12 @@ __global__ void sphForceKernelJList(
             double qij2 = dr2 * hi_sq_inv;
             double qj_ij2 = dr2 * hsqinv[j];
 
-            double dr    = sqrt(dr2);
-            double runix = dx / dr;   // unit vector (r_i - r_j) / |r_i - r_j|
-            double runiy = dy / dr;
-            double runiz = dz / dr;
+            // as force.F90: one division for the unit vector, and q = r/h from it
+            const double dr   = sqrt(dr2);
+            const double rij1 = 1.0 / dr;
+            const double runix = dx * rij1;   // unit vector (r_i - r_j) / |r_i - r_j|
+            const double runiy = dy * rij1;
+            const double runiz = dz * rij1;
             const double dvxij = vx[i] - vx[j];
             const double dvyij = vy[i] - vy[j];
             const double dvzij = vz[i] - vz[j];
@@ -278,15 +283,14 @@ __global__ void sphForceKernelJList(
             double qrho2j = 0.0;
 
             const double denij  = eni - enj;
-            const double rhoav1 = 2.0 / (rhoi + rhoj);
-            const double vsigu  = sqrt(fabs(pri - prj) * rhoav1);
+            const double vsigu  = sqrt(fabs(pri - prj) * (2.0 / (rhoi + rhoj)));
 
             if constexpr (DiscVisc)
             {
                 // phantom's disc_viscosity (force.F90), how a Shakura-Sunyaev alpha is
                 // modelled with the artificial viscosity: scaled by h/r_ij, and applied to
                 // receding pairs too, without the beta term
-                const double hor_i = hi / dr, hor_j = hj / dr;
+                const double hor_i = hi * rij1, hor_j = hj * rij1;
                 if (projv < 0.0)
                 {
                     qrho2i = -0.5 * rho1i * (alphai * vwavei - beta * projv) * hor_i * projv;
@@ -308,8 +312,8 @@ __global__ void sphForceKernelJList(
             {
                 vsigmax_i = fmax(vsigmax_i, pair_vsigmax);
 
-                double qij, wij, grwij;
-                qij = sqrt(qij2);
+                double wij, grwij;
+                const double qij = dr * hinv[i];
                 sph::m4_kern(qij, wij, grwij);
 
                 // div v: projv is already (v_i - v_j) . r_ij / |r_ij|
@@ -327,7 +331,7 @@ __global__ void sphForceKernelJList(
                 const double pdvtermi     = pmass * pro2i * projv * gradkerni;
                 // disc viscosity heats with its own form, as in force.F90
                 const double dudtdissi    = DiscVisc
-                    ? -0.5 * pmass * rho1i * alphai * vwavei * (hi / dr) * projv * projv * gradkerni
+                    ? -0.5 * pmass * rho1i * alphai * vwavei * (hi * rij1) * projv * projv * gradkerni
                     : pmass * qrho2i * projv * gradkerni;
                 const double dendisstermi = vsigu * denij * autermi * gradkerni;
 
@@ -348,8 +352,8 @@ __global__ void sphForceKernelJList(
             {
                 vsigmax_i = fmax(vsigmax_i, pair_vsigmax);
 
-                double qj_ij, wj_ij, grwj_ij;
-                qj_ij = sqrt(qj_ij2);
+                double wj_ij, grwj_ij;
+                const double qj_ij = dr * hinv[j];
                 sph::m4_kern(qj_ij, wj_ij, grwj_ij);
 
                 double gradkernj   = grwj_ij * grkfac[j];   // F_ij(h_j) / omega_j
@@ -425,10 +429,10 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     for (auto* v : {&s.fx, &s.fy, &s.fz, &s.f4, &s.vsigmax, &s.divvF}) v->resize(n);
     HIP_CHECK(hipEventRecord(e1));
 
-    for (auto* v : {&s.hsqinv, &s.rhoh, &s.rho1, &s.grkfac, &s.pres, &s.auterm, &s.divfac}) v->resize(n);
+    for (auto* v : {&s.hsqinv, &s.hinv, &s.rhoh, &s.rho1, &s.grkfac, &s.pres, &s.auterm, &s.divfac}) v->resize(n);
     forcePrepKernel<<<iceil(n, 256), 256>>>(
         rawPtr(s.h), rawPtr(s.gradh), rawPtr(s.pro2),
-        rawPtr(s.hsqinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
+        rawPtr(s.hsqinv), rawPtr(s.hinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
         rawPtr(s.pres), rawPtr(s.auterm), rawPtr(s.divfac),
         n, pmass, alphau);
     checkGpuErrors(cudaGetLastError());
@@ -443,7 +447,7 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
                 rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
                 rawPtr(s.h),
                 rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
-                rawPtr(s.hsqinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
+                rawPtr(s.hsqinv), rawPtr(s.hinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
                 rawPtr(s.pres), rawPtr(s.auterm), rawPtr(s.divfac),
                 rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
                 rawPtr(s.vsigmax), rawPtr(s.divvF),
