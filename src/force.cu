@@ -193,9 +193,18 @@ __global__ void sphForceKernelJList(
             nearestImage<Periodic>(dx, dy, dz, box);
             double dr2 = dx*dx + dy*dy + dz*dz;
             if (!(dr2 > 0.0)) continue;
+
+            // Cheap reject before any division or square root: ~95% of candidates are
+            // outside both kernels.  The margin keeps it conservative, so the exact tests
+            // below still decide every pair as before.
+            const double hj = h[j];
+            {
+                const double rmax2 = sph::radk2 * fmax(hi * hi, hj * hj) * (1.0 + 1e-10);
+                if (dr2 >= rmax2) continue;
+            }
+
             double qij2 = dr2 * hi_sq_inv;
 
-            const double hj        = h[j];
             const double hj_sq_inv = 1.0 / (hj * hj);
             const double hj_4_inv  = hj_sq_inv * hj_sq_inv;
 
