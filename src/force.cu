@@ -91,7 +91,8 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
 
 // SPH force on one particle per thread, over the symmetric j-leaf list.  Threads index
 // Hilbert-sorted particles.
-template<bool Periodic>
+// DiscVisc selects phantom's disc_viscosity form of the artificial viscosity (see below).
+template<bool Periodic, bool DiscVisc>
 __global__ void sphForceKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -233,7 +234,24 @@ __global__ void sphForceKernelJList(
             const double rhoav1 = 2.0 / (rhoi + rhoj);
             const double vsigu  = sqrt(fabs(pri - prj) * rhoav1);
 
-            if (projv < 0.0)
+            if constexpr (DiscVisc)
+            {
+                // phantom's disc_viscosity (force.F90), how a Shakura-Sunyaev alpha is
+                // modelled with the artificial viscosity: scaled by h/r_ij, and applied to
+                // receding pairs too, without the beta term
+                const double hor_i = hi / dr, hor_j = hj / dr;
+                if (projv < 0.0)
+                {
+                    qrho2i = -0.5 * rho1i * (alphai * vwavei - beta * projv) * hor_i * projv;
+                    qrho2j = -0.5 * rho1j * (alphaj * vwavej - beta * projv) * hor_j * projv;
+                }
+                else
+                {
+                    qrho2i = -0.5 * rho1i * alphai * vwavei * hor_i * projv;
+                    qrho2j = -0.5 * rho1j * alphaj * vwavej * hor_j * projv;
+                }
+            }
+            else if (projv < 0.0)
             {
                 qrho2i = -0.5 * rho1i * vsigavi * projv;
                 qrho2j = -0.5 * rho1j * vsigavj * projv;
@@ -260,7 +278,10 @@ __global__ void sphForceKernelJList(
 
                 // du/dt: p dV work, viscous heating, conductivity
                 const double pdvtermi     = pmass * pro2i * projv * gradkerni;
-                const double dudtdissi    = pmass * qrho2i * projv * gradkerni;
+                // disc viscosity heats with its own form, as in force.F90
+                const double dudtdissi    = DiscVisc
+                    ? -0.5 * pmass * rho1i * alphai * vwavei * (hi / dr) * projv * projv * gradkerni
+                    : pmass * qrho2i * projv * gradkerni;
                 const double dendisstermi = vsigu * denij * autermi * gradkerni;
 
                 f4sum += pdvtermi;
@@ -309,7 +330,7 @@ __global__ void sphForceKernelJList(
 }
 
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
-                   double alphau, ForceTimings& ft)
+                   double alphau, bool discViscosity, ForceTimings& ft)
 {
     const int n = s.ngas;
 
@@ -357,8 +378,8 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     HIP_CHECK(hipEventRecord(e1));
 
     // Periodic or not is whatever the density solve built this tree with.
-    dispatchPeriodic(s.box, [&](auto periodic) {
-        sphForceKernelJList<decltype(periodic)::value><<<iceil(n, 256), 256>>>(
+    auto launch = [&](auto periodic, auto disc) {
+        sphForceKernelJList<decltype(periodic)::value, decltype(disc)::value><<<iceil(n, 256), 256>>>(
             rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
             rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
             rawPtr(s.h), rawPtr(s.gradh),
@@ -368,6 +389,10 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
             n, pmass, beta, alphau,
             rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
             rawPtr(s.layout), s.box);
+    };
+    dispatchPeriodic(s.box, [&](auto periodic) {
+        if (discViscosity) launch(periodic, std::true_type{});
+        else               launch(periodic, std::false_type{});
     });
     checkGpuErrors(cudaGetLastError());
     HIP_CHECK(hipEventRecord(e2));

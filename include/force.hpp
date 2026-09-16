@@ -73,4 +73,4 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft);
  * moved since it.
  */
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
-                   double alphau, ForceTimings& ft);
+                   double alphau, bool discViscosity, ForceTimings& ft);
