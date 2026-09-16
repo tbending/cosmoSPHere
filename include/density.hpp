@@ -81,6 +81,7 @@ struct GradFields
 // periodicBox is nullptr for open boundaries, or {xmin, xmax, ymin, ymax, zmin, zmax}
 // of a domain periodic in all three directions, with every live particle inside it.
 // The choice holds for the force pass on the same tree too.
+// tolh is the Newton convergence tolerance on |dh/h|, phantom's tolh.
 //
 // Leaves the tree, the Hilbert-sorted particle data and the leaf bookkeeping in the
 // shared state, so a repeated solve reuses the allocations — see gpu_state.hpp.
@@ -94,4 +95,5 @@ DensTimings solveDensH(double* h_host,
                        double pmass,
                        KernelMode mode = KernelMode::FLAT_PARTICLE,
                        const GradFields* grads = nullptr,
-                       const double* periodicBox = nullptr);
+                       const double* periodicBox = nullptr,
+                       double tolh = 1.0e-4);

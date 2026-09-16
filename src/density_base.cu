@@ -48,6 +48,7 @@
 // clamp, a shock particle can need >>10 iterations); iterations run on the
 // shrinking unconverged set, so the extra budget is cheap.
 static constexpr int    MAX_ITER = 100;
+// HTOL is the legacy per-particle kernel's tolerance; the solve takes phantom's tolh.
 static constexpr double HTOL     = 1.0e-4;
 
 // ---------------------------------------------------------------------------
@@ -250,7 +251,8 @@ __global__ void sphDensityKernelJList(
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout,
-    Box<double>      box)
+    Box<double>      box,
+    double           tolh)        // relative change in h below which h is converged
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= nActive) return;
@@ -327,7 +329,7 @@ __global__ void sphDensityKernelJList(
     rho[i]       = rho_i;
     gradh[i]     = grad_i;
     h[i]         = hi_new;
-    converged[i] = (fabs((hi_new - hi) / hi_old) < HTOL) ? 1 : 0;
+    converged[i] = (fabs((hi_new - hi) / hi_old) < tolh) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -376,7 +378,8 @@ __global__ void sphDensityKernelLeafWarp(
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout,
-    Box<double>      box)
+    Box<double>      box,
+    double           tolh)        // relative change in h below which h is converged
 {
     // Shared memory caches the j-leaf list for this i-leaf.  Under CSR a leaf's count
     // is unbounded (the torus reached 1494), so the cache is a fixed tile and any
@@ -468,7 +471,7 @@ __global__ void sphDensityKernelLeafWarp(
     rho[i]       = rho_i;
     gradh[i]     = grad_i;
     h[i]         = hi_new;
-    converged[i] = (fabs((hi_new - hi) / hi_old) < HTOL) ? 1 : 0;
+    converged[i] = (fabs((hi_new - hi) / hi_old) < tolh) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -724,7 +727,8 @@ DensTimings solveDensH(// Host input/output
                         double pmass,
                         KernelMode mode,
                         const GradFields* grads,
-                        const double* periodicBox)
+                        const double* periodicBox,
+                        double tolh)
 {
     // One GPU, one state.  force_gpu_c picks up the same one.
     GpuState& s = gpuState();
@@ -844,7 +848,7 @@ DensTimings solveDensH(// Host input/output
                         nActiveLeaves, rawPtr(d_activeLeaves),
                         pmass,
                         rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-                        rawPtr(s.layout), s.box);
+                        rawPtr(s.layout), s.box, tolh);
                 });
             }
             else
@@ -857,7 +861,7 @@ DensTimings solveDensH(// Host input/output
                         pmass,
                         rawPtr(s.particleLeaf),
                         rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-                        rawPtr(s.layout), s.box);
+                        rawPtr(s.layout), s.box, tolh);
                 });
             }
             checkGpuErrors(cudaGetLastError());

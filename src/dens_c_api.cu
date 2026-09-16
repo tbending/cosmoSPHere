@@ -61,7 +61,8 @@ extern "C" void densityiterate_gpu_c(
     int           n,
     double        pmass,
     int           periodic,  // nonzero: periodic in x, y and z
-    const double* box)       // {xmin, xmax, ymin, ymax, zmin, zmax}; read only if periodic
+    const double* box,       // {xmin, xmax, ymin, ymax, zmin, zmax}; read only if periodic
+    double        tolh)      // Newton tolerance on |dh/h|, phantom's tolh
 {
     // Set COSMO_DENS_STATS=1 for a one-line phase breakdown per solve on stderr.
     // Costs two clock reads when off.
@@ -74,7 +75,7 @@ extern "C" void densityiterate_gpu_c(
     auto t1 = clk::now();
     DensTimings t = solveDensH(h, rho, gradh_out, x, y, z, n, pmass,
                                KernelMode::FLAT_PARTICLE, &grads,
-                               periodic ? box : nullptr);
+                               periodic ? box : nullptr, tolh);
     auto t2 = clk::now();
 
     // COSMO_MEM: one line per run with device memory in use and the host high-water

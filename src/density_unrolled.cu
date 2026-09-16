@@ -645,7 +645,8 @@ DensTimings solveDensH(// Host input/output
                         double pmass,
                         KernelMode mode,
                         const GradFields* grads,
-                        const double* periodicBox)
+                        const double* periodicBox,
+                        double /* tolh: this variant keeps its own HTOL */)
 {
     const int ngas = n;
     DensTimings t{};
