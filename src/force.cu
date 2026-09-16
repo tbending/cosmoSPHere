@@ -89,6 +89,50 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
             ovf[0], ovf[1]);
 }
 
+// Per-particle factors of the force sum, formed once per pass instead of once per pair.
+// The expressions are those the kernel used to evaluate in its loop, in the same order.
+__global__ void forcePrepKernel(
+    const double* __restrict__ h,
+    const double* __restrict__ gradh,
+    const double* __restrict__ pro2,
+    double* __restrict__ hsqinv,   // 1/h^2
+    double* __restrict__ rhoh,     // rho(h), as phantom's rhoh, not the summed density
+    double* __restrict__ rho1,     // 1/rho
+    double* __restrict__ grkfac,   // cnormk h^-4 / Omega: grad W's factor, F_ij(h)/Omega
+    double* __restrict__ pres,     // P = pro2 rho^2
+    double* __restrict__ auterm,   // conductivity factor 0.5 m alphau / rho
+    double* __restrict__ divfac,   // factor turning the div v sum into div v
+    int n,
+    double pmass,
+    double alphau)
+{
+    const int i = blockDim.x * blockIdx.x + threadIdx.x;
+    if (i >= n) return;
+
+    const double hi = h[i];
+    if (!(hi > 0.0))   // dead: never a neighbour, and its own force is set to zero
+    {
+        hsqinv[i] = 0.0; rhoh[i] = 0.0; rho1[i] = 0.0; grkfac[i] = 0.0;
+        pres[i] = 0.0; auterm[i] = 0.0; divfac[i] = 0.0;
+        return;
+    }
+    const double h_sq_inv = 1.0 / (hi * hi);
+    const double h_4_inv  = h_sq_inv * h_sq_inv;
+    const double hfoh     = sph::hfact / hi;
+    const double rho      = pmass * hfoh * hfoh * hfoh;
+    const double dhdrho   = -hi / (3.0 * rho);
+    const double omega    = 1.0 - dhdrho * gradh[i];
+    const double omega_inv = 1 / omega;
+
+    hsqinv[i] = h_sq_inv;
+    rhoh[i]   = rho;
+    rho1[i]   = 1.0 / rho;
+    grkfac[i] = h_4_inv * sph::cnormk * omega_inv;
+    pres[i]   = pro2[i] * rho * rho;
+    auterm[i] = 0.5 * pmass * (1.0 / rho) * alphau;
+    divfac[i] = sph::cnormk * omega_inv * h_4_inv / rho;
+}
+
 // SPH force on one particle per thread, over the symmetric j-leaf list.  Threads index
 // Hilbert-sorted particles.
 // DiscVisc selects phantom's disc_viscosity form of the artificial viscosity (see below).
@@ -104,11 +148,17 @@ __global__ void sphForceKernelJList(
     const double* __restrict__ vy,
     const double* __restrict__ vz,
     const double* __restrict__ h,
-    const double* __restrict__ gradh,
     const double* __restrict__ pro2,
     const double* __restrict__ spsound,
     const double* __restrict__ alphaAV,
     const double* __restrict__ u,
+    const double* __restrict__ hsqinv,
+    const double* __restrict__ rhoh,
+    const double* __restrict__ rho1,
+    const double* __restrict__ grkfac,
+    const double* __restrict__ pres,
+    const double* __restrict__ auterm,
+    const double* __restrict__ divfac,
     double* __restrict__ fx,
     double* __restrict__ fy,
     double* __restrict__ fz,
@@ -118,7 +168,6 @@ __global__ void sphForceKernelJList(
     int n,
     double pmass,
     double beta,
-    double alphau,
     bool pdvHeating,          // phantom's ipdv_heating
     bool shockHeating,        // phantom's ishock_heating
     const int* __restrict__ particleLeaf,
@@ -146,26 +195,17 @@ __global__ void sphForceKernelJList(
     }
 
     const double xi = x[i], yi = y[i], zi = z[i];
-    const double hi_sq_inv = 1.0 / (hi * hi);
-    const double hi_4_inv  = hi_sq_inv * hi_sq_inv;
-
-    // rhoh(hi), as in phantom's force.F90, not the summed density
-    const double hfoh_i = sph::hfact / hi;
-    const double rhoi   = pmass * hfoh_i * hfoh_i * hfoh_i;
-
-    const double grad_i      = gradh[i];   // d(rho)/dh at fixed q, from the density solve
-    const double dhdrhoi     = -hi / (3.0 * rhoi);
-    const double omegai      = 1.0 - dhdrhoi * grad_i;
-    const double omega_inv_i = 1 / omegai;
-    const double hfacgrkerni = hi_4_inv * sph::cnormk * omega_inv_i;   // hfacgrkern in force.F90
+    const double hi_sq_inv   = hsqinv[i];
+    const double rhoi        = rhoh[i];
+    const double hfacgrkerni = grkfac[i];   // hfacgrkern in force.F90
 
     const double pro2i   = pro2[i];
     const double vwavei  = spsound[i];
     const double alphai  = alphaAV[i];
     const double eni     = u[i];
-    const double rho1i   = 1.0 / rhoi;
-    const double pri     = pro2i * rhoi * rhoi;
-    const double autermi = 0.5 * pmass * rho1i * alphau;
+    const double rho1i   = rho1[i];
+    const double pri     = pres[i];
+    const double autermi = auterm[i];
 
     double itermx = 0.0;   // force from neighbours inside h_i
     double itermy = 0.0;
@@ -204,11 +244,7 @@ __global__ void sphForceKernelJList(
             }
 
             double qij2 = dr2 * hi_sq_inv;
-
-            const double hj_sq_inv = 1.0 / (hj * hj);
-            const double hj_4_inv  = hj_sq_inv * hj_sq_inv;
-
-            double qj_ij2 = dr2 * hj_sq_inv;
+            double qj_ij2 = dr2 * hsqinv[j];
 
             double dr    = sqrt(dr2);
             double runix = dx / dr;   // unit vector (r_i - r_j) / |r_i - r_j|
@@ -219,18 +255,15 @@ __global__ void sphForceKernelJList(
             const double dvzij = vz[i] - vz[j];
             const double projv = dvxij * runix + dvyij * runiy + dvzij * runiz;
 
-            // rhoh(hj)
-            const double hfoh_j = sph::hfact / hj;
-            const double rhoj   = pmass * hfoh_j * hfoh_j * hfoh_j;
-
-            const double rho1j   = 1.0 / rhoj;
+            const double rhoj    = rhoh[j];
+            const double rho1j   = rho1[j];
             const double pro2j   = pro2[j];
             const double vwavej  = spsound[j];
             const double alphaj  = alphaAV[j];
             const double enj     = u[j];
 
-            const double prj     = pro2j * rhoj * rhoj;
-            const double autermj = 0.5 * pmass * rho1j * alphau;
+            const double prj     = pres[j];
+            const double autermj = auterm[j];
 
             // signal speeds: vsig* with alpha = 1 for the timestep,
             // vsigav* with the particle's alpha for the viscosity
@@ -319,13 +352,7 @@ __global__ void sphForceKernelJList(
                 qj_ij = sqrt(qj_ij2);
                 sph::m4_kern(qj_ij, wj_ij, grwj_ij);
 
-                const double dhdrhoj     = -hj / (3.0 * rhoj);
-                const double grad_j      = gradh[j];
-                const double omegaj      = 1.0 - dhdrhoj * grad_j;
-                const double omega_inv_j = 1 / omegaj;
-
-                double hfacgrkernj = hj_4_inv * sph::cnormk * omega_inv_j;
-                double gradkernj   = grwj_ij * hfacgrkernj;   // F_ij(h_j) / omega_j
+                double gradkernj   = grwj_ij * grkfac[j];   // F_ij(h_j) / omega_j
 
                 const double gradpj = pmass * (pro2j + qrho2j) * gradkernj;
 
@@ -346,9 +373,7 @@ __global__ void sphForceKernelJList(
     f4[i]      = f4sum;
     vsigmax[i] = vsigmax_i;
 
-    const double term_divv = sph::cnormk * omega_inv_i * hi_4_inv / rhoi;
-
-    divv[i] = -divv_s * term_divv;
+    divv[i] = -divv_s * divfac[i];
 }
 
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
@@ -400,6 +425,14 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     for (auto* v : {&s.fx, &s.fy, &s.fz, &s.f4, &s.vsigmax, &s.divvF}) v->resize(n);
     HIP_CHECK(hipEventRecord(e1));
 
+    for (auto* v : {&s.hsqinv, &s.rhoh, &s.rho1, &s.grkfac, &s.pres, &s.auterm, &s.divfac}) v->resize(n);
+    forcePrepKernel<<<iceil(n, 256), 256>>>(
+        rawPtr(s.h), rawPtr(s.gradh), rawPtr(s.pro2),
+        rawPtr(s.hsqinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
+        rawPtr(s.pres), rawPtr(s.auterm), rawPtr(s.divfac),
+        n, pmass, alphau);
+    checkGpuErrors(cudaGetLastError());
+
     // Periodic or not is whatever the density solve built this tree with.
     const bool fullHeating = pdvHeating && shockHeating;
     auto launch = [&](auto periodic, auto disc) {
@@ -408,11 +441,13 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
                                 decltype(heat)::value><<<iceil(n, 256), 256>>>(
                 rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
                 rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
-                rawPtr(s.h), rawPtr(s.gradh),
+                rawPtr(s.h),
                 rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
+                rawPtr(s.hsqinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
+                rawPtr(s.pres), rawPtr(s.auterm), rawPtr(s.divfac),
                 rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
                 rawPtr(s.vsigmax), rawPtr(s.divvF),
-                n, pmass, beta, alphau, pdvHeating, shockHeating,
+                n, pmass, beta, pdvHeating, shockHeating,
                 rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
                 rawPtr(s.layout), s.box);
         };
