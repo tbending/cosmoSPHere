@@ -918,10 +918,16 @@ DensTimings solveDensH(// Host input/output
     {
         int ovf[2] = {0, 0};
         HIP_CHECK(hipMemcpy(ovf, rawPtr(s.overflow), 2*sizeof(int), hipMemcpyDeviceToHost));
+        // As the CPU path (densityiterate: "could not converge in density"), stop rather
+        // than hand the force pass densities from an unfinished solve or a neighbour
+        // list with particles missing.
         if (nActive > 0 || ovf[0] > 0 || ovf[1] > 0)
+        {
             std::fprintf(stderr,
-                "WARNING! solveDensH: unconverged=%d jlist_trunc=%d stack_drops=%d "
+                "FATAL: solveDensH: unconverged=%d jlist_trunc=%d stack_drops=%d "
                 "(iters=%d)\n", nActive, ovf[0], ovf[1], t.itersRun);
+            std::abort();
+        }
     }
 
     // Every kernel takes ONE image per pair, which is only right while the kernel

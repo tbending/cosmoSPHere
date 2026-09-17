@@ -123,7 +123,9 @@ __global__ void forcePrepKernel(
     const double rho      = pmass * hfoh * hfoh * hfoh;
     const double dhdrho   = -hi / (3.0 * rho);
     const double omega    = 1.0 - dhdrho * gradh[i];
-    const double omega_inv = 1 / omega;
+    // as the gradient kernel: a non-positive omega (possible where h changes sharply) falls
+    // back to 1 rather than dividing by it
+    const double omega_inv = (omega > 0.0) ? (1 / omega) : 1.0;
 
     hsqinv[i] = h_sq_inv;
     hinv[i]   = 1.0 / hi;
@@ -390,8 +392,8 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
 
     // Phase boundaries on the device timeline, like buildForceJLeafList: recording
     // an event does not synchronise, so timing does not perturb what it measures.
-    cudaEvent_t e0, e1, e2, e3;
-    for (auto* e : {&e0, &e1, &e2, &e3}) checkGpuErrors(hipEventCreate(e));
+    cudaEvent_t e0, e1, ep, e2, e3;
+    for (auto* e : {&e0, &e1, &ep, &e2, &e3}) checkGpuErrors(hipEventCreate(e));
     HIP_CHECK(hipEventRecord(e0));
 
     // Every device buffer lives in GpuState and is resized to n, a no-op after the first
@@ -436,6 +438,7 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
         rawPtr(s.pres), rawPtr(s.auterm), rawPtr(s.divfac),
         n, pmass, alphau);
     checkGpuErrors(cudaGetLastError());
+    HIP_CHECK(hipEventRecord(ep));
 
     // Periodic or not is whatever the density solve built this tree with.
     const bool fullHeating = pdvHeating && shockHeating;
@@ -483,7 +486,8 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     checkGpuErrors(hipEventSynchronize(e3));
     float ms = 0;
     HIP_CHECK(hipEventElapsedTime(&ms, e0, e1)); ft.upload   = ms * 1e-3;
-    HIP_CHECK(hipEventElapsedTime(&ms, e1, e2)); ft.kernel   = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, e1, ep)); ft.prep     = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, ep, e2)); ft.kernel   = ms * 1e-3;
     HIP_CHECK(hipEventElapsedTime(&ms, e2, e3)); ft.download = ms * 1e-3;
-    for (auto* e : {&e0, &e1, &e2, &e3}) HIP_CHECK(hipEventDestroy(*e));
+    for (auto* e : {&e0, &e1, &ep, &e2, &e3}) HIP_CHECK(hipEventDestroy(*e));
 }

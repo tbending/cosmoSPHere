@@ -73,13 +73,13 @@ extern "C" void force_gpu_c(
     if (stats)
     {
         const double wall = std::chrono::duration<double>(clk::now() - t0).count();
-        const double gpu  = ft.hmaxUpsweep + ft.jleafBuild + ft.upload + ft.kernel + ft.download;
+        const double gpu  = ft.hmaxUpsweep + ft.jleafBuild + ft.upload + ft.prep + ft.kernel + ft.download;
         std::fprintf(stderr, "COSMO_FORCE n=%d leaves=%d | upsweep=%.2f jbuild=%.2f "
-                             "upload=%.2f kernel=%.2f download=%.2f | gpusum=%.2f "
+                             "upload=%.2f prep=%.2f kernel=%.2f download=%.2f | gpusum=%.2f "
                              "wall=%.2f unaccounted=%.2f\n",
                      s.ngas, s.nLeaves,
                      1e3*ft.hmaxUpsweep, 1e3*ft.jleafBuild,
-                     1e3*ft.upload, 1e3*ft.kernel, 1e3*ft.download,
+                     1e3*ft.upload, 1e3*ft.prep, 1e3*ft.kernel, 1e3*ft.download,
                      1e3*gpu, 1e3*wall, 1e3*(wall - gpu));
     }
 }
