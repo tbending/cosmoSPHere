@@ -36,6 +36,8 @@ extern "C" void force_gpu_c(
     double beta,
     double alphau,
     int disc_viscosity,   // nonzero: phantom's disc_viscosity form of the artificial viscosity
+    int pdv_heating,      // phantom's ipdv_heating: 0 leaves p dV work out of du/dt
+    int shock_heating,    // phantom's ishock_heating: 0 leaves shock heating out of du/dt
     double* fx,
     double* fy,
     double* fz,
@@ -61,7 +63,8 @@ extern "C" void force_gpu_c(
     ForceFields f{vx, vy, vz, pro2, spsound, alphaAV, u,
                   fx, fy, fz, f4, vsigmax, divv};
     ForceTimings ft;
-    computeForces(s, f, pmass, beta, alphau, disc_viscosity != 0, ft);
+    computeForces(s, f, pmass, beta, alphau, disc_viscosity != 0,
+                  pdv_heating > 0, shock_heating > 0, ft);
 
     // Same env gate as the density solve, so one setting shows the whole picture.
     // wall is measured on the host around the whole call; wall - gpusum is host-side

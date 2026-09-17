@@ -72,5 +72,8 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft);
  * density solve for the same particle set (GpuState::readyForForce), with positions not
  * moved since it.
  */
+// pdvHeating and shockHeating are phantom's ipdv_heating and ishock_heating: which
+// terms go into du/dt.
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
-                   double alphau, bool discViscosity, ForceTimings& ft);
+                   double alphau, bool discViscosity, bool pdvHeating,
+                   bool shockHeating, ForceTimings& ft);

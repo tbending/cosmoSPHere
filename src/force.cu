@@ -92,7 +92,10 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
 // SPH force on one particle per thread, over the symmetric j-leaf list.  Threads index
 // Hilbert-sorted particles.
 // DiscVisc selects phantom's disc_viscosity form of the artificial viscosity (see below).
-template<bool Periodic, bool DiscVisc>
+// FullHeating is the usual case, p dV work and shock heating both in du/dt; otherwise the
+// runtime pdvHeating and shockHeating choose.  A template parameter so the usual case
+// compiles exactly as it did before the switches existed.
+template<bool Periodic, bool DiscVisc, bool FullHeating>
 __global__ void sphForceKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -116,6 +119,8 @@ __global__ void sphForceKernelJList(
     double pmass,
     double beta,
     double alphau,
+    bool pdvHeating,          // phantom's ipdv_heating
+    bool shockHeating,        // phantom's ishock_heating
     const int* __restrict__ particleLeaf,
     const int* __restrict__ jOffset,
     const int* __restrict__ jcount,
@@ -284,8 +289,16 @@ __global__ void sphForceKernelJList(
                     : pmass * qrho2i * projv * gradkerni;
                 const double dendisstermi = vsigu * denij * autermi * gradkerni;
 
-                f4sum += pdvtermi;
-                f4sum += dudtdissi;
+                if constexpr (FullHeating)
+                {
+                    f4sum += pdvtermi;
+                    f4sum += dudtdissi;
+                }
+                else
+                {
+                    if (pdvHeating)   f4sum += pdvtermi;
+                    if (shockHeating) f4sum += dudtdissi;
+                }
                 f4sum += dendisstermi;
             }
 
@@ -330,7 +343,8 @@ __global__ void sphForceKernelJList(
 }
 
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
-                   double alphau, bool discViscosity, ForceTimings& ft)
+                   double alphau, bool discViscosity, bool pdvHeating,
+                   bool shockHeating, ForceTimings& ft)
 {
     const int n = s.ngas;
 
@@ -378,17 +392,23 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     HIP_CHECK(hipEventRecord(e1));
 
     // Periodic or not is whatever the density solve built this tree with.
+    const bool fullHeating = pdvHeating && shockHeating;
     auto launch = [&](auto periodic, auto disc) {
-        sphForceKernelJList<decltype(periodic)::value, decltype(disc)::value><<<iceil(n, 256), 256>>>(
-            rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-            rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
-            rawPtr(s.h), rawPtr(s.gradh),
-            rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
-            rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
-            rawPtr(s.vsigmax), rawPtr(s.divvF),
-            n, pmass, beta, alphau,
-            rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-            rawPtr(s.layout), s.box);
+        auto run = [&](auto heat) {
+            sphForceKernelJList<decltype(periodic)::value, decltype(disc)::value,
+                                decltype(heat)::value><<<iceil(n, 256), 256>>>(
+                rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+                rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
+                rawPtr(s.h), rawPtr(s.gradh),
+                rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
+                rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
+                rawPtr(s.vsigmax), rawPtr(s.divvF),
+                n, pmass, beta, alphau, pdvHeating, shockHeating,
+                rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+                rawPtr(s.layout), s.box);
+        };
+        if (fullHeating) run(std::true_type{});
+        else             run(std::false_type{});
     };
     dispatchPeriodic(s.box, [&](auto periodic) {
         if (discViscosity) launch(periodic, std::true_type{});
