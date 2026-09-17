@@ -84,7 +84,7 @@ __device__ inline void accumulateLeaf(
         if (qij2 < sph::radk2)
         {
             double qij = sqrt(qij2), wij, grwij;
-            sph::m4_kern(qij, wij, grwij);
+            sph::kern(qij2, qij, wij, grwij);
             rhoi   += wij;
             gradhi += -qij * grwij - 3.0 * wij;
         }
@@ -193,7 +193,7 @@ __global__ void sphDensityKernel(const double* __restrict__ x,
     // Newton Jacobian from THIS density (part.F90 dhdrho = -h/(3*rhoh(h))), NOT
     // from the SPH sum rho_i.  They coincide only at convergence; using rho_i
     // off-convergence gives a different step and omega (this fix under test).
-    const double rhoh_i  = pmass * (sph::hfact * hi1) * (sph::hfact * hi1) * (sph::hfact * hi1);
+    const double rhoh_i  = pmass * (sph::hfact_default * hi1) * (sph::hfact_default * hi1) * (sph::hfact_default * hi1);
     const double funci   = rhoh_i - rho_i;
     const double dhdrhoi = -hi / (3.0 * rhoh_i);
     // omega must use the NORMALISED grad_i (= d(rho)/d(h)), matching Fortran:
@@ -252,7 +252,8 @@ __global__ void sphDensityKernelJList(
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout,
     Box<double>      box,
-    double           tolh)        // relative change in h below which h is converged
+    double           tolh,        // relative change in h below which h is converged
+    double           hfact)       // rho = pmass (hfact/h)^3
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= nActive) return;
@@ -283,7 +284,7 @@ __global__ void sphDensityKernelJList(
             {
                 double qij, wij, grwij;
                 qij = sqrt(qij2);
-                sph::m4_kern(qij, wij, grwij);
+                sph::kern(qij2, qij, wij, grwij);
                 rhoi  += wij;
                 gradhi += -qij * grwij - 3.0 * wij;
             }
@@ -312,7 +313,7 @@ __global__ void sphDensityKernelJList(
 
     // dhdrho uses rhoh(h)=pmass*(hfact/h)^3, matching the CPU (part.F90 dhdrho),
     // NOT the SPH sum rho_i.  See sphDensityKernel for the rationale.
-    const double rhoh_i  = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1);
+    const double rhoh_i  = pmass * (hfact*hi1) * (hfact*hi1) * (hfact*hi1);
     const double funci   = rhoh_i - rho_i;
     const double dhdrhoi = -hi / (3.0 * rhoh_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
@@ -379,7 +380,8 @@ __global__ void sphDensityKernelLeafWarp(
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout,
     Box<double>      box,
-    double           tolh)        // relative change in h below which h is converged
+    double           tolh,        // relative change in h below which h is converged
+    double           hfact)       // rho = pmass (hfact/h)^3
 {
     // Shared memory caches the j-leaf list for this i-leaf.  Under CSR a leaf's count
     // is unbounded (the torus reached 1494), so the cache is a fixed tile and any
@@ -431,7 +433,7 @@ __global__ void sphDensityKernelLeafWarp(
             {
                 double qij, wij, grwij;
                 qij = sqrt(qij2);
-                sph::m4_kern(qij, wij, grwij);
+                sph::kern(qij2, qij, wij, grwij);
                 rhoi  += wij;
                 gradhi += -qij * grwij - 3.0 * wij;
             }
@@ -454,7 +456,7 @@ __global__ void sphDensityKernelLeafWarp(
 
     // dhdrho uses rhoh(h)=pmass*(hfact/h)^3, matching the CPU (part.F90 dhdrho),
     // NOT the SPH sum rho_i.  See sphDensityKernel for the rationale.
-    const double rhoh_i  = pmass * (sph::hfact*hi1) * (sph::hfact*hi1) * (sph::hfact*hi1);
+    const double rhoh_i  = pmass * (hfact*hi1) * (hfact*hi1) * (hfact*hi1);
     const double funci   = rhoh_i - rho_i;
     const double dhdrhoi = -hi / (3.0 * rhoh_i);
     // omega uses NORMALISED grad_i, matching Fortran dens.f90.
@@ -593,7 +595,7 @@ __global__ void sphGradientsKernel(
 
             const double qij = sqrt(qij2);
             double wij, grwij;
-            sph::m4_kern(qij, wij, grwij);
+            sph::kern(qij2, qij, wij, grwij);
 
             rhoi   += wij;
             gradhi += -qij * grwij - 3.0 * wij;
@@ -728,7 +730,8 @@ DensTimings solveDensH(// Host input/output
                         KernelMode mode,
                         const GradFields* grads,
                         const double* periodicBox,
-                        double tolh)
+                        double tolh,
+                        double hfact)
 {
     // One GPU, one state.  force_gpu_c picks up the same one.
     GpuState& s = gpuState();
@@ -748,7 +751,9 @@ DensTimings solveDensH(// Host input/output
     // cannot leak values from the previous step.
     // -----------------------------------------------------------------------
     HIP_CHECK(hipEventRecord(evUpload0));
-    s.ngas = ngas;
+    if (!(hfact > 0.0)) hfact = sph::hfact_default;
+    s.ngas  = ngas;
+    s.hfact = hfact;   // the force pass on this tree uses the same h-rho relation
     s.x.assign(x_host, x_host + ngas);
     s.y.assign(y_host, y_host + ngas);
     s.z.assign(z_host, z_host + ngas);
@@ -848,7 +853,7 @@ DensTimings solveDensH(// Host input/output
                         nActiveLeaves, rawPtr(d_activeLeaves),
                         pmass,
                         rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-                        rawPtr(s.layout), s.box, tolh);
+                        rawPtr(s.layout), s.box, tolh, hfact);
                 });
             }
             else
@@ -861,7 +866,7 @@ DensTimings solveDensH(// Host input/output
                         pmass,
                         rawPtr(s.particleLeaf),
                         rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-                        rawPtr(s.layout), s.box, tolh);
+                        rawPtr(s.layout), s.box, tolh, hfact);
                 });
             }
             checkGpuErrors(cudaGetLastError());
@@ -918,10 +923,16 @@ DensTimings solveDensH(// Host input/output
     {
         int ovf[2] = {0, 0};
         HIP_CHECK(hipMemcpy(ovf, rawPtr(s.overflow), 2*sizeof(int), hipMemcpyDeviceToHost));
+        // As the CPU path (densityiterate: "could not converge in density"), stop rather
+        // than hand the force pass densities from an unfinished solve or a neighbour
+        // list with particles missing.
         if (nActive > 0 || ovf[0] > 0 || ovf[1] > 0)
+        {
             std::fprintf(stderr,
-                "WARNING! solveDensH: unconverged=%d jlist_trunc=%d stack_drops=%d "
+                "FATAL: solveDensH: unconverged=%d jlist_trunc=%d stack_drops=%d "
                 "(iters=%d)\n", nActive, ovf[0], ovf[1], t.itersRun);
+            std::abort();
+        }
     }
 
     // Every kernel takes ONE image per pair, which is only right while the kernel
@@ -935,9 +946,9 @@ DensTimings solveDensH(// Host input/output
         if (sph::radkernel * hmax >= 0.5 * lmin)
         {
             std::fprintf(stderr,
-                "FATAL: solveDensH: kernel support 2h = %g reaches half the periodic box "
+                "FATAL: solveDensH: kernel support %gh = %g reaches half the periodic box "
                 "(smallest side %g); too few particles for this box\n",
-                sph::radkernel * hmax, lmin);
+                sph::radkernel, sph::radkernel * hmax, lmin);
             std::abort();
         }
     }

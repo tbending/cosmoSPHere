@@ -34,6 +34,7 @@
 
 #include "density.hpp"
 #include "gpu_check.hpp"
+#include "kernel.hpp"
 #include "util/cuda_utils.hpp"
 
 #include <chrono>
@@ -62,7 +63,8 @@ extern "C" void densityiterate_gpu_c(
     double        pmass,
     int           periodic,  // nonzero: periodic in x, y and z
     const double* box,       // {xmin, xmax, ymin, ymax, zmin, zmax}; read only if periodic
-    double        tolh)      // Newton tolerance on |dh/h|, phantom's tolh
+    double        tolh,      // Newton tolerance on |dh/h|, phantom's tolh
+    double        hfact)     // rho = pmass (hfact/h)^3, phantom's hfact
 {
     // Set COSMO_DENS_STATS=1 for a one-line phase breakdown per solve on stderr.
     // Costs two clock reads when off.
@@ -75,7 +77,7 @@ extern "C" void densityiterate_gpu_c(
     auto t1 = clk::now();
     DensTimings t = solveDensH(h, rho, gradh_out, x, y, z, n, pmass,
                                KernelMode::FLAT_PARTICLE, &grads,
-                               periodic ? box : nullptr, tolh);
+                               periodic ? box : nullptr, tolh, hfact);
     auto t2 = clk::now();
 
     // COSMO_MEM: one line per run with device memory in use and the host high-water
@@ -119,4 +121,11 @@ extern "C" void densityiterate_gpu_c(
             1e3*t.gradJleafBuild, 1e3*t.gradKernel, 1e3*t.download,
             gpu, solve, solve - gpu, ms(t0, t2));
     }
+}
+
+// The support radius, in units of h, of the kernel this library was built with, so the
+// caller can check it matches its own (KERNEL=cubic -> 2, KERNEL=quintic -> 3).
+extern "C" double cosmo_kernel_radius(void)
+{
+    return sph::radkernel;
 }

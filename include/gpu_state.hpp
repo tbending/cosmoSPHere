@@ -75,10 +75,13 @@ struct GpuState
 
     // ---- force pass buffers, sized to ngas and reused across calls ----
     thrust::device_vector<double> pro2, spsound, alphaAV, u;         // inputs, Hilbert order
+    // per-particle factors of the force sum, formed once per pass (forcePrepKernel)
+    thrust::device_vector<double> hsqinv, hinv, rhoh, rho1, grkfac, pres, auterm, divfac;
     thrust::device_vector<double> fx, fy, fz, f4, vsigmax, divvF;   // outputs, Hilbert order
     thrust::device_vector<double> fStage;        // one array in phantom order, either direction
 
     int ngas     = 0;
+    double hfact = 0.0;   // h-rho relation of the last density solve, for the force pass
     // Live particles (h > 0) form the prefix [0, nAlive) of the Hilbert order; dead
     // ones sit after it, belong to no leaf, never enter a j-list, and keep the values
     // phantom gave them (in particular their negative h).
