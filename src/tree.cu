@@ -27,7 +27,8 @@
 
 void buildTree(GpuState& s,
                const std::vector<thrust::device_vector<double>*>& alsoSort,
-               TreeTimings& tt)
+               TreeTimings& tt,
+               const double* periodicBox)
 {
     const int ngas = s.ngas;
 
@@ -37,28 +38,39 @@ void buildTree(GpuState& s,
     // -----------------------------------------------------------------------
     // Bounding box — entirely on the GPU.  Avoids 6 serial host loops over 10M
     // elements.
+    //
+    // A periodic domain is the box itself: a node's nearest image is only meaningful
+    // against the true period, so it is neither fitted to the particles nor padded
+    // to a cube.  The caller has wrapped the particles into it.
     // -----------------------------------------------------------------------
     HIP_CHECK(hipEventRecord(e0));
-    double xmin, xmax, ymin, ymax, zmin, zmax;
+    if (periodicBox)
+    {
+        const double* b = periodicBox;
+        s.box = Box<double>{b[0], b[1], b[2], b[3], b[4], b[5],
+                            BoundaryType::periodic, BoundaryType::periodic,
+                            BoundaryType::periodic};
+    }
+    else
     {
         auto [xlo, xhi] = thrust::minmax_element(thrust::device, s.x.begin(), s.x.end());
         auto [ylo, yhi] = thrust::minmax_element(thrust::device, s.y.begin(), s.y.end());
         auto [zlo, zhi] = thrust::minmax_element(thrust::device, s.z.begin(), s.z.end());
         // Dereferencing device iterators triggers an implicit device→host copy.
-        xmin = *xlo; xmax = *xhi;
-        ymin = *ylo; ymax = *yhi;
-        zmin = *zlo; zmax = *zhi;
+        const double xmin = *xlo, xmax = *xhi;
+        const double ymin = *ylo, ymax = *yhi;
+        const double zmin = *zlo, zmax = *zhi;
+
+        // Pad box slightly (mirrors Fortran *1.00001 on the largest side).
+        double maxSpan = std::max({xmax-xmin, ymax-ymin, zmax-zmin}) * 1.00001;
+        double xctr = 0.5*(xmin+xmax), yctr = 0.5*(ymin+ymax), zctr = 0.5*(zmin+zmax);
+        double half = 0.5 * maxSpan;
+        s.box = Box<double>{xctr - half, xctr + half,
+                            yctr - half, yctr + half,
+                            zctr - half, zctr + half,
+                            BoundaryType::open};
     }
     HIP_CHECK(hipEventRecord(e1));
-
-    // Pad box slightly (mirrors Fortran *1.00001 on the largest side).
-    double maxSpan = std::max({xmax-xmin, ymax-ymin, zmax-zmin}) * 1.00001;
-    double xctr = 0.5*(xmin+xmax), yctr = 0.5*(ymin+ymax), zctr = 0.5*(zmin+zmax);
-    double half = 0.5 * maxSpan;
-    s.box = Box<double>{xctr - half, xctr + half,
-                        yctr - half, yctr + half,
-                        zctr - half, zctr + half,
-                        BoundaryType::open};
 
     // -----------------------------------------------------------------------
     // Hilbert keys + GPU sort

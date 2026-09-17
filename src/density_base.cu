@@ -37,6 +37,8 @@
 #include <thrust/unique.h>
 #include <thrust/copy.h>
 #include <thrust/fill.h>
+#include <thrust/functional.h>
+#include <thrust/reduce.h>
 #include <thrust/iterator/permutation_iterator.h>
 
 #include "kernel.hpp"
@@ -46,6 +48,7 @@
 // clamp, a shock particle can need >>10 iterations); iterations run on the
 // shrinking unconverged set, so the extra budget is cheap.
 static constexpr int    MAX_ITER = 100;
+// HTOL is the legacy per-particle kernel's tolerance; the solve takes phantom's tolh.
 static constexpr double HTOL     = 1.0e-4;
 
 // ---------------------------------------------------------------------------
@@ -231,6 +234,7 @@ __global__ void sphDensityKernel(const double* __restrict__ x,
 // 1 to BUCKET_SIZE depending on local density.  The sort-by-leaf preparation
 // ensures warp coherence even when leaves are partially filled.
 // ---------------------------------------------------------------------------
+template<bool Periodic>
 __global__ void sphDensityKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -246,7 +250,9 @@ __global__ void sphDensityKernelJList(
     const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
-    const unsigned*  __restrict__ layout)
+    const unsigned*  __restrict__ layout,
+    Box<double>      box,
+    double           tolh)        // relative change in h below which h is converged
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= nActive) return;
@@ -271,6 +277,7 @@ __global__ void sphDensityKernelJList(
             double dx   = xi - x[j];
             double dy   = yi - y[j];
             double dz   = zi - z[j];
+            nearestImage<Periodic>(dx, dy, dz, box);
             double qij2 = (dx*dx + dy*dy + dz*dz) * hi_sq_inv;
             if (qij2 < sph::radk2)
             {
@@ -322,7 +329,7 @@ __global__ void sphDensityKernelJList(
     rho[i]       = rho_i;
     gradh[i]     = grad_i;
     h[i]         = hi_new;
-    converged[i] = (fabs((hi_new - hi) / hi_old) < HTOL) ? 1 : 0;
+    converged[i] = (fabs((hi_new - hi) / hi_old) < tolh) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +362,7 @@ __global__ void sphDensityKernelJList(
 // 1.  We do not guard on converged[i] before the hot j-loop to avoid warp
 // divergence; the redundant rho/gradh writes are harmless.
 // ---------------------------------------------------------------------------
+template<bool Periodic>
 __global__ void sphDensityKernelLeafWarp(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -369,7 +377,9 @@ __global__ void sphDensityKernelLeafWarp(
     const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
-    const unsigned*  __restrict__ layout)
+    const unsigned*  __restrict__ layout,
+    Box<double>      box,
+    double           tolh)        // relative change in h below which h is converged
 {
     // Shared memory caches the j-leaf list for this i-leaf.  Under CSR a leaf's count
     // is unbounded (the torus reached 1494), so the cache is a fixed tile and any
@@ -415,6 +425,7 @@ __global__ void sphDensityKernelLeafWarp(
             double dx   = xi - x[j];
             double dy   = yi - y[j];
             double dz   = zi - z[j];
+            nearestImage<Periodic>(dx, dy, dz, box);
             double qij2 = (dx*dx + dy*dy + dz*dz) * hi_sq_inv;
             if (qij2 < sph::radk2)
             {
@@ -460,7 +471,7 @@ __global__ void sphDensityKernelLeafWarp(
     rho[i]       = rho_i;
     gradh[i]     = grad_i;
     h[i]         = hi_new;
-    converged[i] = (fabs((hi_new - hi) / hi_old) < HTOL) ? 1 : 0;
+    converged[i] = (fabs((hi_new - hi) / hi_old) < tolh) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +524,7 @@ __device__ inline double xiLimiter(const double g[9])
     return (fac + traceS > 2.220446049250313e-16) ? fac / (fac + traceS) : 1.0;   // epsilon(0.)
 }
 
+template<bool Periodic>
 __global__ void sphGradientsKernel(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -535,7 +547,8 @@ __global__ void sphGradientsKernel(
     const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
-    const unsigned*  __restrict__ layout)
+    const unsigned*  __restrict__ layout,
+    Box<double>      box)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= ngas) return;
@@ -570,9 +583,10 @@ __global__ void sphGradientsKernel(
         const int jLeaf = jlist[jBase + jl];
         for (unsigned j = layout[jLeaf]; j < layout[jLeaf + 1]; ++j)
         {
-            const double dx = xi - x[j];
-            const double dy = yi - y[j];
-            const double dz = zi - z[j];
+            double dx = xi - x[j];
+            double dy = yi - y[j];
+            double dz = zi - z[j];
+            nearestImage<Periodic>(dx, dy, dz, box);
             const double r2 = dx*dx + dy*dy + dz*dz;
             const double qij2 = r2 * hi_sq_inv;
             if (qij2 >= sph::radk2) continue;
@@ -712,7 +726,9 @@ DensTimings solveDensH(// Host input/output
                         int n,
                         double pmass,
                         KernelMode mode,
-                        const GradFields* grads)
+                        const GradFields* grads,
+                        const double* periodicBox,
+                        double tolh)
 {
     // One GPU, one state.  force_gpu_c picks up the same one.
     GpuState& s = gpuState();
@@ -768,7 +784,7 @@ DensTimings solveDensH(// Host input/output
     // the leaf/particle maps — all of which outlive this call for the force pass.
     // -----------------------------------------------------------------------
     TreeTimings tt;
-    buildTree(s, alsoSort, tt);
+    buildTree(s, alsoSort, tt, periodicBox);
     t.bboxAndSetup = tt.bbox;
     t.keysAndSort  = tt.keysSort;
     t.treeBuild    = tt.build;
@@ -825,24 +841,28 @@ DensTimings solveDensH(// Host input/output
 
             if (mode == KernelMode::WARP_PER_LEAF)
             {
-                sphDensityKernelLeafWarp<<<nActiveLeaves, BUCKET_SIZE>>>(
-                    rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-                    rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
-                    nActiveLeaves, rawPtr(d_activeLeaves),
-                    pmass,
-                    rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-                    rawPtr(s.layout));
+                dispatchPeriodic(s.box, [&](auto periodic) {
+                    sphDensityKernelLeafWarp<decltype(periodic)::value><<<nActiveLeaves, BUCKET_SIZE>>>(
+                        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+                        rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
+                        nActiveLeaves, rawPtr(d_activeLeaves),
+                        pmass,
+                        rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+                        rawPtr(s.layout), s.box, tolh);
+                });
             }
             else
             {
-                sphDensityKernelJList<<<iceil(nActive, BLK2), BLK2>>>(
-                    rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-                    rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
-                    nActive, rawPtr(d_activeParticles),
-                    pmass,
-                    rawPtr(s.particleLeaf),
-                    rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-                    rawPtr(s.layout));
+                dispatchPeriodic(s.box, [&](auto periodic) {
+                    sphDensityKernelJList<decltype(periodic)::value><<<iceil(nActive, BLK2), BLK2>>>(
+                        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+                        rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
+                        nActive, rawPtr(d_activeParticles),
+                        pmass,
+                        rawPtr(s.particleLeaf),
+                        rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+                        rawPtr(s.layout), s.box, tolh);
+                });
             }
             checkGpuErrors(cudaGetLastError());
 
@@ -904,6 +924,24 @@ DensTimings solveDensH(// Host input/output
                 "(iters=%d)\n", nActive, ovf[0], ovf[1], t.itersRun);
     }
 
+    // Every kernel takes ONE image per pair, which is only right while the kernel
+    // support is under half the box: past that a neighbour can be in range through
+    // two images and one of them is silently dropped.
+    if (s.box.boundaryX() == BoundaryType::periodic && s.nAlive > 0)
+    {
+        const double hmax = thrust::reduce(thrust::device, s.h.begin(), s.h.begin() + s.nAlive,
+                                           0.0, thrust::maximum<double>());
+        const double lmin = std::min({s.box.lx(), s.box.ly(), s.box.lz()});
+        if (sph::radkernel * hmax >= 0.5 * lmin)
+        {
+            std::fprintf(stderr,
+                "FATAL: solveDensH: kernel support 2h = %g reaches half the periodic box "
+                "(smallest side %g); too few particles for this box\n",
+                sph::radkernel * hmax, lmin);
+            std::abort();
+        }
+    }
+
     // ---------------------------------------------------------------
     // Post-convergence gradient sweep (optional).
     //
@@ -938,16 +976,18 @@ DensTimings solveDensH(// Host input/output
         buildJLeafListsCSR<false>(s, nullptr);
         HIP_CHECK(hipEventRecord(evGJ));
 
-        sphGradientsKernel<<<iceil(ngas, 256), 256>>>(
-            rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-            rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
-            rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
-            rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh),
-            rawPtr(d_divv), rawPtr(d_xi), rawPtr(d_ddivvdt),
-            ngas, pmass,
-            rawPtr(s.particleLeaf),
-            rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-            rawPtr(s.layout));
+        dispatchPeriodic(s.box, [&](auto periodic) {
+            sphGradientsKernel<decltype(periodic)::value><<<iceil(ngas, 256), 256>>>(
+                rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+                rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
+                rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
+                rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh),
+                rawPtr(d_divv), rawPtr(d_xi), rawPtr(d_ddivvdt),
+                ngas, pmass,
+                rawPtr(s.particleLeaf),
+                rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+                rawPtr(s.layout), s.box);
+        });
         checkGpuErrors(cudaGetLastError());
 
         HIP_CHECK(hipEventRecord(evG1));

@@ -91,6 +91,11 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
 
 // SPH force on one particle per thread, over the symmetric j-leaf list.  Threads index
 // Hilbert-sorted particles.
+// DiscVisc selects phantom's disc_viscosity form of the artificial viscosity (see below).
+// FullHeating is the usual case, p dV work and shock heating both in du/dt; otherwise the
+// runtime pdvHeating and shockHeating choose.  A template parameter so the usual case
+// compiles exactly as it did before the switches existed.
+template<bool Periodic, bool DiscVisc, bool FullHeating>
 __global__ void sphForceKernelJList(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -114,11 +119,14 @@ __global__ void sphForceKernelJList(
     double pmass,
     double beta,
     double alphau,
+    bool pdvHeating,          // phantom's ipdv_heating
+    bool shockHeating,        // phantom's ishock_heating
     const int* __restrict__ particleLeaf,
     const int* __restrict__ jOffset,
     const int* __restrict__ jcount,
     const int* __restrict__ jlist,
-    const unsigned* __restrict__ layout)
+    const unsigned* __restrict__ layout,
+    Box<double> box)
 {
     const int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= n) return;
@@ -182,6 +190,7 @@ __global__ void sphForceKernelJList(
             double dx  = xi - x[j];
             double dy  = yi - y[j];
             double dz  = zi - z[j];
+            nearestImage<Periodic>(dx, dy, dz, box);
             double dr2 = dx*dx + dy*dy + dz*dz;
             if (!(dr2 > 0.0)) continue;
             double qij2 = dr2 * hi_sq_inv;
@@ -230,7 +239,24 @@ __global__ void sphForceKernelJList(
             const double rhoav1 = 2.0 / (rhoi + rhoj);
             const double vsigu  = sqrt(fabs(pri - prj) * rhoav1);
 
-            if (projv < 0.0)
+            if constexpr (DiscVisc)
+            {
+                // phantom's disc_viscosity (force.F90), how a Shakura-Sunyaev alpha is
+                // modelled with the artificial viscosity: scaled by h/r_ij, and applied to
+                // receding pairs too, without the beta term
+                const double hor_i = hi / dr, hor_j = hj / dr;
+                if (projv < 0.0)
+                {
+                    qrho2i = -0.5 * rho1i * (alphai * vwavei - beta * projv) * hor_i * projv;
+                    qrho2j = -0.5 * rho1j * (alphaj * vwavej - beta * projv) * hor_j * projv;
+                }
+                else
+                {
+                    qrho2i = -0.5 * rho1i * alphai * vwavei * hor_i * projv;
+                    qrho2j = -0.5 * rho1j * alphaj * vwavej * hor_j * projv;
+                }
+            }
+            else if (projv < 0.0)
             {
                 qrho2i = -0.5 * rho1i * vsigavi * projv;
                 qrho2j = -0.5 * rho1j * vsigavj * projv;
@@ -257,11 +283,22 @@ __global__ void sphForceKernelJList(
 
                 // du/dt: p dV work, viscous heating, conductivity
                 const double pdvtermi     = pmass * pro2i * projv * gradkerni;
-                const double dudtdissi    = pmass * qrho2i * projv * gradkerni;
+                // disc viscosity heats with its own form, as in force.F90
+                const double dudtdissi    = DiscVisc
+                    ? -0.5 * pmass * rho1i * alphai * vwavei * (hi / dr) * projv * projv * gradkerni
+                    : pmass * qrho2i * projv * gradkerni;
                 const double dendisstermi = vsigu * denij * autermi * gradkerni;
 
-                f4sum += pdvtermi;
-                f4sum += dudtdissi;
+                if constexpr (FullHeating)
+                {
+                    f4sum += pdvtermi;
+                    f4sum += dudtdissi;
+                }
+                else
+                {
+                    if (pdvHeating)   f4sum += pdvtermi;
+                    if (shockHeating) f4sum += dudtdissi;
+                }
                 f4sum += dendisstermi;
             }
 
@@ -306,7 +343,8 @@ __global__ void sphForceKernelJList(
 }
 
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
-                   double alphau, ForceTimings& ft)
+                   double alphau, bool discViscosity, bool pdvHeating,
+                   bool shockHeating, ForceTimings& ft)
 {
     const int n = s.ngas;
 
@@ -353,16 +391,29 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     for (auto* v : {&s.fx, &s.fy, &s.fz, &s.f4, &s.vsigmax, &s.divvF}) v->resize(n);
     HIP_CHECK(hipEventRecord(e1));
 
-    sphForceKernelJList<<<iceil(n, 256), 256>>>(
-        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
-        rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
-        rawPtr(s.h), rawPtr(s.gradh),
-        rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
-        rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
-        rawPtr(s.vsigmax), rawPtr(s.divvF),
-        n, pmass, beta, alphau,
-        rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
-        rawPtr(s.layout));
+    // Periodic or not is whatever the density solve built this tree with.
+    const bool fullHeating = pdvHeating && shockHeating;
+    auto launch = [&](auto periodic, auto disc) {
+        auto run = [&](auto heat) {
+            sphForceKernelJList<decltype(periodic)::value, decltype(disc)::value,
+                                decltype(heat)::value><<<iceil(n, 256), 256>>>(
+                rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+                rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
+                rawPtr(s.h), rawPtr(s.gradh),
+                rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
+                rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
+                rawPtr(s.vsigmax), rawPtr(s.divvF),
+                n, pmass, beta, alphau, pdvHeating, shockHeating,
+                rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+                rawPtr(s.layout), s.box);
+        };
+        if (fullHeating) run(std::true_type{});
+        else             run(std::false_type{});
+    };
+    dispatchPeriodic(s.box, [&](auto periodic) {
+        if (discViscosity) launch(periodic, std::true_type{});
+        else               launch(periodic, std::false_type{});
+    });
     checkGpuErrors(cudaGetLastError());
     HIP_CHECK(hipEventRecord(e2));
     HIP_CHECK(hipDeviceSynchronize());

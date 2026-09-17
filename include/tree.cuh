@@ -14,11 +14,21 @@
  *
  * buildJLeafListKernel stays a template in a header because density needs <false>
  * and force <true>; in a .cu that would take explicit instantiation naming both.
+ *
+ * PERIODIC BOUNDARIES
+ * -------------------
+ * As in phantom, there are no ghost particles: a pair is taken at its nearest periodic
+ * image, and a node at its nearest image of the i-leaf.  Every kernel that measures a
+ * distance takes a Periodic template parameter, selected once per launch from s.box by
+ * dispatchPeriodic, so the open-boundary code is compiled exactly as it was.  One image
+ * per pair is only right while the kernel support is under half the box;
+ * solveDensH checks that.
  */
 
 #pragma once
 
 #include <cstdint>
+#include <type_traits>
 
 #include <thrust/device_vector.h>
 #include <thrust/execution_policy.h>
@@ -40,6 +50,37 @@ using namespace cstone;
 // Smaller = finer tree (more nodes, shorter j-loops per node).
 // 64 is a good balance for O(50) neighbours; tune if needed.
 static constexpr unsigned BUCKET_SIZE = 64;
+
+/*! @brief Call @p f with std::true_type if @p box is periodic, else std::false_type.
+ *
+ * Lets a launch site pick a kernel's Periodic instantiation without writing its
+ * argument list twice:
+ *     dispatchPeriodic(s.box, [&](auto p) { kernel<decltype(p)::value><<<...>>>(...); });
+ * Phantom's periodicity is all or nothing, so the x boundary stands for all three.
+ */
+template<class F>
+inline void dispatchPeriodic(const Box<double>& box, F&& f)
+{
+    if (box.boundaryX() == BoundaryType::periodic) f(std::true_type{});
+    else                                           f(std::false_type{});
+}
+
+/*! @brief Nearest periodic image of a pair separation, in place.
+ *
+ * The same test and arithmetic as phantom's dens.F90 and force.F90
+ * (dx = dx - dxbound*sign(1,dx) when |dx| > dxbound/2), so the GPU and CPU paths agree
+ * on which image a pair uses.  Compiles to nothing when Periodic is false.
+ */
+template<bool Periodic>
+__device__ inline void nearestImage(double& dx, double& dy, double& dz, const Box<double>& box)
+{
+    if constexpr (Periodic)
+    {
+        if (fabs(dx) > 0.5 * box.lx()) dx = dx - box.lx() * copysign(1.0, dx);
+        if (fabs(dy) > 0.5 * box.ly()) dy = dy - box.ly() * copysign(1.0, dy);
+        if (fabs(dz) > 0.5 * box.lz()) dz = dz - box.lz() * copysign(1.0, dz);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GPU kernel: compute Hilbert keys for all particles
@@ -181,8 +222,9 @@ static __global__ void hmaxUpsweepKernel(TreeNodeIndex first,
  *     candidate, so the i-box cannot be pre-inflated; tested as a Euclidean distance
  *     between the raw boxes, which is tighter than inflate-and-overlap and costs the
  *     same.
+ * Periodic: the distance between the two boxes is taken between their nearest images.
  */
-template<bool Symmetric>
+template<bool Symmetric, bool Periodic>
 __device__ inline bool nodeInRange(const Vec3<double>& iCenter,
                                    const Vec3<double>& iSize,
                                    const Vec3<double>& iHalf,
@@ -190,16 +232,21 @@ __device__ inline bool nodeInRange(const Vec3<double>& iCenter,
                                    const double* __restrict__ hmax_node,
                                    TreeNodeIndex node,
                                    const Vec3<double>* __restrict__ centers,
-                                   const Vec3<double>* __restrict__ sizes)
+                                   const Vec3<double>* __restrict__ sizes,
+                                   const Box<double>& box)
 {
+    const Vec3<double>& aSize = Symmetric ? iSize : iHalf;
+    const Vec3<double>  d     = Periodic
+                                    ? minDistance(iCenter, aSize, centers[node], sizes[node], box)
+                                    : minDistance(iCenter, aSize, centers[node], sizes[node]);
     if constexpr (Symmetric)
     {
         const double rs = fmax(twoHi, 2.0 * hmax_node[node]);
-        return norm2(minDistance(iCenter, iSize, centers[node], sizes[node])) <= rs * rs;
+        return norm2(d) <= rs * rs;
     }
     else
     {
-        return norm2(minDistance(iCenter, iHalf, centers[node], sizes[node])) <= 0.0;
+        return norm2(d) <= 0.0;
     }
 }
 
@@ -207,7 +254,7 @@ __device__ inline bool nodeInRange(const Vec3<double>& iCenter,
 // Symmetric=false: gather only (density); hmax_node may be nullptr.
 // Symmetric=true : gather + scatter (force); hmax_node must cover all numNodes,
 //                  i.e. hmaxUpsweepKernel must have run over the whole tree.
-template<bool Symmetric>
+template<bool Symmetric, bool Periodic>
 __global__ void buildJLeafListKernel(
     const TreeNodeIndex* __restrict__ leafToInternal,
     const double*         __restrict__ hmax_leaf,
@@ -221,7 +268,8 @@ __global__ void buildJLeafListKernel(
     const int* __restrict__ jOffset,  // CSR offsets, nLeaves+1; unused when counting
     int* __restrict__ jlist,          // nullptr: count only, into jcount
     int* __restrict__ jcount,
-    int* __restrict__ overflow)   // [0] += jlist truncations, [1] += stack drops
+    int* __restrict__ overflow,   // [0] += jlist truncations, [1] += stack drops
+    Box<double> box)
 {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= nActiveLeaves) return;
@@ -259,7 +307,8 @@ __global__ void buildJLeafListKernel(
     const int  cap       = countOnly ? 0 : jOffset[iLeaf + 1] - jOffset[iLeaf];
 
     // Check root overlap.
-    if (!nodeInRange<Symmetric>(iCenter, iSize, iHalf, twoHi, hmax_node, 0, centers, sizes))
+    if (!nodeInRange<Symmetric, Periodic>(iCenter, iSize, iHalf, twoHi, hmax_node, 0,
+                                          centers, sizes, box))
     {
         jcount[iLeaf] = 0;
         return;
@@ -276,8 +325,8 @@ __global__ void buildJLeafListKernel(
         for (int oct = 0; oct < 8; ++oct)
         {
             TreeNodeIndex child = childOffsets[node] + oct;
-            if (!nodeInRange<Symmetric>(iCenter, iSize, iHalf, twoHi, hmax_node, child,
-                                        centers, sizes))
+            if (!nodeInRange<Symmetric, Periodic>(iCenter, iSize, iHalf, twoHi, hmax_node,
+                                                  child, centers, sizes, box))
                 continue;
             if (childOffsets[child] == 0)
             {
@@ -315,12 +364,14 @@ inline void buildJLeafListsCSR(GpuState& s, const double* hmax_node)
     s.jOffset.resize(nL + 1);
 
     auto walk = [&](const int* jOffset, int* jlist) {
-        buildJLeafListKernel<Symmetric><<<iceil(nL, 256), 256>>>(
-            rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), hmax_node,
-            rawPtr(s.centers), rawPtr(s.sizes),
-            rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
-            nL, rawPtr(s.allLeaves),
-            jOffset, jlist, rawPtr(s.jcount), rawPtr(s.overflow));
+        dispatchPeriodic(s.box, [&](auto periodic) {
+            buildJLeafListKernel<Symmetric, decltype(periodic)::value><<<iceil(nL, 256), 256>>>(
+                rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), hmax_node,
+                rawPtr(s.centers), rawPtr(s.sizes),
+                rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
+                nL, rawPtr(s.allLeaves),
+                jOffset, jlist, rawPtr(s.jcount), rawPtr(s.overflow), s.box);
+        });
         checkGpuErrors(cudaGetLastError());
     };
 
@@ -353,7 +404,12 @@ struct TreeTimings
  *
  * Allocations are reused across calls; the tree contents are rebuilt every time,
  * because the particles have moved.
+ *
+ * @p periodicBox: nullptr for open boundaries, when the root box is fitted to the
+ * particles.  Otherwise {xmin, xmax, ymin, ymax, zmin, zmax} of the periodic domain,
+ * which becomes the root box as it is; every live particle must lie inside it.
  */
 void buildTree(GpuState& s,
                const std::vector<thrust::device_vector<double>*>& alsoSort,
-               TreeTimings& tt);
+               TreeTimings& tt,
+               const double* periodicBox = nullptr);
