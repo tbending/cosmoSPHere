@@ -36,6 +36,7 @@
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 #include <thrust/copy.h>
+#include <thrust/fill.h>
 #include <thrust/iterator/permutation_iterator.h>
 
 #include "kernel.hpp"
@@ -242,6 +243,7 @@ __global__ void sphDensityKernelJList(
     const int*    __restrict__ activeParticles,
     double        pmass,
     const int*       __restrict__ particleLeaf,
+    const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout)
@@ -258,7 +260,7 @@ __global__ void sphDensityKernelJList(
     double gradhi = 0.0;
 
     const int iLeaf = particleLeaf[i];
-    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     const int nj    = jcount[iLeaf];
 
     for (int jl = 0; jl < nj; ++jl)
@@ -364,25 +366,29 @@ __global__ void sphDensityKernelLeafWarp(
     int           nActiveLeaves,
     const int*    __restrict__ activeLeaves,
     double        pmass,
+    const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout)
 {
-    // Shared memory caches the complete j-leaf list for this i-leaf.
-    // Cost: MAX_J_PER_LEAF * 4 = 1 KB per block — allows high SM occupancy.
-    __shared__ int sJList[MAX_J_PER_LEAF];
+    // Shared memory caches the j-leaf list for this i-leaf.  Under CSR a leaf's count
+    // is unbounded (the torus reached 1494), so the cache is a fixed tile and any
+    // entries beyond it are read from global memory.  256 covers p90 (~136) with room.
+    constexpr int SJTILE = 256;
+    __shared__ int sJList[SJTILE];
 
     int iLeafIdx = blockIdx.x;
     if (iLeafIdx >= nActiveLeaves) return;
     int iLeaf = activeLeaves[iLeafIdx];
 
     int lane  = threadIdx.x;           // 0 .. BUCKET_SIZE-1
-    int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     int nj    = jcount[iLeaf];
 
     // Cooperatively load j-leaf list into shared memory.
     // All lanes participate so the load is coalesced.
-    for (int k = lane; k < nj; k += blockDim.x)
+    const int nCached = nj < SJTILE ? nj : SJTILE;
+    for (int k = lane; k < nCached; k += blockDim.x)
         sJList[k] = jlist[jBase + k];
     __syncthreads();
 
@@ -403,7 +409,7 @@ __global__ void sphDensityKernelLeafWarp(
 
     for (int jl = 0; jl < nj; ++jl)
     {
-        unsigned jLeaf = (unsigned)sJList[jl];
+        unsigned jLeaf = (unsigned)(jl < SJTILE ? sJList[jl] : jlist[jBase + jl]);
         for (unsigned j = layout[jLeaf]; j < layout[jLeaf + 1]; ++j)
         {
             double dx   = xi - x[j];
@@ -478,6 +484,35 @@ __global__ void sphDensityKernelLeafWarp(
 // Assumes a single particle type (all masses = pmass), which is what the phantom
 // GPU path passes; the CPU restricts the sums to same-type neighbours.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Phantom's Cullen & Dehnen xi limiter (shock_capturing.f90 xi_limiter), from the
+// velocity gradient tensor g in phantom's dvdx ordering.
+//
+// The host used to receive all nine components and evaluate this itself.  To give
+// the same bits, mirror what it does exactly: phantom stores dvdx as real(4), so
+// each component is rounded to float and promoted back, and the arithmetic runs in
+// the same order.  Contraction into fused multiply-adds is switched off for clang
+// (hipcc); nvcc has no per-function control and may contract, which changes xi only
+// in the last bits.
+// ---------------------------------------------------------------------------
+__device__ inline double xiLimiter(const double g[9])
+{
+#if defined(__clang__)
+    #pragma clang fp contract(off)
+#endif
+    const double dvxdx = (float)g[0], dvxdy = (float)g[1], dvxdz = (float)g[2];
+    const double dvydx = (float)g[3], dvydy = (float)g[4], dvydz = (float)g[5];
+    const double dvzdx = (float)g[6], dvzdy = (float)g[7], dvzdz = (float)g[8];
+    const double divv   = dvxdx + dvydy + dvzdz;
+    const double curlvx = dvzdy - dvydz;
+    const double curlvy = dvxdz - dvzdx;
+    const double curlvz = dvydx - dvxdy;
+    const double mdiv   = fmax(-divv, 0.0);
+    const double fac    = mdiv * mdiv;
+    const double traceS = curlvx*curlvx + curlvy*curlvy + curlvz*curlvz;
+    return (fac + traceS > 2.220446049250313e-16) ? fac / (fac + traceS) : 1.0;   // epsilon(0.)
+}
+
 __global__ void sphGradientsKernel(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -492,17 +527,27 @@ __global__ void sphGradientsKernel(
     double*       rho,                   // out, re-evaluated at converged h
     double*       gradh,                 // out, d(rho)/d(h) at converged h
     double*       divv,                  // out
-    double*       dvdx,                  // out, component-major: dvdx[c*ngas + i]
+    double*       xiLim,                 // out, Cullen & Dehnen xi limiter
     double*       ddivvdt,               // out
     int           ngas,
     double        pmass,
     const int*       __restrict__ particleLeaf,
+    const int*       __restrict__ jOffset,
     const int*       __restrict__ jcount,
     const int*       __restrict__ jlist,
     const unsigned*  __restrict__ layout)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     if (i >= ngas) return;
+
+    // Dead particles (h <= 0) sit past nAlive and belong to no leaf, so particleLeaf
+    // is not set for them: return zeros before reading it.
+    if (!(h[i] > 0.0))
+    {
+        divv[i] = 0.0; ddivvdt[i] = 0.0;
+        xiLim[i] = 1.0;   // xi_limiter of a zero tensor
+        return;
+    }
 
     const double xi = x[i],  yi = y[i],  zi = z[i];
     const double vxi = vx[i], vyi = vy[i], vzi = vz[i];
@@ -517,7 +562,7 @@ __global__ void sphGradientsKernel(
     double rxx = 0.0, rxy = 0.0, rxz = 0.0, ryy = 0.0, ryz = 0.0, rzz = 0.0;
 
     const int iLeaf = particleLeaf[i];
-    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     const int nj    = jcount[iLeaf];
 
     for (int jl = 0; jl < nj; ++jl)
@@ -584,7 +629,7 @@ __global__ void sphGradientsKernel(
     if (!(rho_i > 0.0))
     {
         divv[i] = 0.0; ddivvdt[i] = 0.0;
-        for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = 0.0;
+        xiLim[i] = 1.0;   // xi_limiter of a zero tensor
         return;
     }
 
@@ -643,25 +688,13 @@ __global__ void sphGradientsKernel(
         div_a = -term * (da[0] + da[4] + da[8]);
     }
 
-    for (int c = 0; c < 9; ++c) dvdx[(size_t)c*ngas + i] = g[c];
+    // xi is the only use of the full tensor outside this kernel, so it is formed here
+    // and the nine components never leave the device.
+    xiLim[i] = xiLimiter(g);
 
     // divcurlvi(5): div_a minus the nonlinear tr(dv.dv) term
     ddivvdt[i] = div_a - (g[0]*g[0] + g[4]*g[4] + g[8]*g[8]
                           + 2.0*(g[1]*g[3] + g[2]*g[6] + g[5]*g[7]));
-}
-
-// Undo the Hilbert sort for the 9-component tensor and interleave it into the
-// (9,n) layout phantom expects, in one pass: out[9*orig + c] = in[c*ngas + srt].
-__global__ void scatterDvdxKernel(const double* __restrict__ in,
-                                  const int*    __restrict__ order,
-                                  double*       __restrict__ out,
-                                  int ngas)
-{
-    int srt = blockDim.x * blockIdx.x + threadIdx.x;
-    if (srt >= ngas) return;
-    const int orig = order[srt];
-    for (int c = 0; c < 9; ++c)
-        out[(size_t)9*orig + c] = in[(size_t)c*ngas + srt];
 }
 
 
@@ -669,13 +702,14 @@ __global__ void scatterDvdxKernel(const double* __restrict__ in,
 // Host driver: build the tree, solve for h, then sweep the gradients.
 // ---------------------------------------------------------------------------
 DensTimings solveDensH(// Host input/output
-                        std::vector<double>& h_host,
-                        std::vector<double>& rho_host,
-                        std::vector<double>& gradh_host,
+                        double* h_host,
+                        double* rho_host,
+                        double* gradh_host,
                         // Host input (read-only)
-                        const std::vector<double>& x_host,
-                        const std::vector<double>& y_host,
-                        const std::vector<double>& z_host,
+                        const double* x_host,
+                        const double* y_host,
+                        const double* z_host,
+                        int n,
                         double pmass,
                         KernelMode mode,
                         const GradFields* grads)
@@ -683,7 +717,7 @@ DensTimings solveDensH(// Host input/output
     // One GPU, one state.  force_gpu_c picks up the same one.
     GpuState& s = gpuState();
 
-    const int ngas = static_cast<int>(x_host.size());
+    const int ngas = n;
     DensTimings t{};
     t.kernelMode = mode;
     t.nParticles = ngas;
@@ -699,17 +733,22 @@ DensTimings solveDensH(// Host input/output
     // -----------------------------------------------------------------------
     HIP_CHECK(hipEventRecord(evUpload0));
     s.ngas = ngas;
-    s.x.assign(x_host.begin(), x_host.end());
-    s.y.assign(y_host.begin(), y_host.end());
-    s.z.assign(z_host.begin(), z_host.end());
-    s.h.assign(h_host.begin(), h_host.end());
+    s.x.assign(x_host, x_host + ngas);
+    s.y.assign(y_host, y_host + ngas);
+    s.z.assign(z_host, z_host + ngas);
+    s.h.assign(h_host, h_host + ngas);
     s.rho.assign(ngas, 0.0);
     s.gradh.assign(ngas, 0.0);
-    thrust::device_vector<int> d_converged(ngas, 0);
+    // Scratch lives in `s` and is resized, not reallocated, on each solve.
+    auto& d_converged = s.converged;
+    d_converged.resize(ngas);
+    thrust::fill(d_converged.begin(), d_converged.end(), 0);
 
     // Velocity and acceleration are only needed for the gradient sweep.  Velocity
     // persists because force needs it; acceleration does not.
-    thrust::device_vector<double> d_ax, d_ay, d_az;
+    auto& d_ax = s.ax;
+    auto& d_ay = s.ay;
+    auto& d_az = s.az;
     s.vx.clear(); s.vy.clear(); s.vz.clear();
     std::vector<thrust::device_vector<double>*> alsoSort;
     if (grads)
@@ -740,18 +779,24 @@ DensTimings solveDensH(// Host input/output
 
     // Active sets — start as all particles / all leaves, compacted to the
     // unconverged ones after each iteration.
-    thrust::device_vector<int> d_activeParticles(ngas);
-    thrust::device_vector<int> d_activeTmp(ngas);       // scratch for copy_if
-    thrust::device_vector<int> d_activeLeaves(nLeaves);
-    thrust::device_vector<int> d_activeLeavesTmp(ngas); // scratch (ngas upper bound)
-    thrust::sequence(d_activeParticles.begin(), d_activeParticles.end());
+    auto& d_activeParticles = s.activeParticles;
+    auto& d_activeTmp       = s.activeTmp;         // scratch for copy_if
+    auto& d_activeLeaves    = s.activeLeaves;
+    auto& d_activeLeavesTmp = s.activeLeavesTmp;   // scratch (ngas upper bound)
+    d_activeParticles.resize(ngas);
+    d_activeTmp.resize(ngas);
+    d_activeLeaves.resize(nLeaves);
+    d_activeLeavesTmp.resize(ngas);
+    // Solve for live particles only: dead ones sit past nAlive in the Hilbert order,
+    // belong to no leaf, and keep the negative h phantom gave them.
+    thrust::sequence(d_activeParticles.begin(), d_activeParticles.begin() + s.nAlive);
     thrust::sequence(d_activeLeaves.begin(),   d_activeLeaves.end());
-    int nActive       = ngas;
+    int nActive       = s.nAlive;
     int nActiveLeaves = nLeaves;
 
     // -----------------------------------------------------------------------
     // Newton iteration.  Each pass:
-    //   a) rebuild hmax + gather j-leaf list, for the active leaves only
+    //   a) refresh hmax for the active leaves, rebuild the gather j-leaf lists
     //   b) one density kernel over the active particles
     //   c) compact the active sets to whatever is still unconverged
     //
@@ -772,14 +817,10 @@ DensTimings solveDensH(// Host input/output
                 rawPtr(s.hmax_leaf));
             checkGpuErrors(cudaGetLastError());
 
-            buildJLeafListKernel<false><<<iceil(nActiveLeaves, 256), 256>>>(
-                rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), nullptr,
-                rawPtr(s.centers), rawPtr(s.sizes),
-                rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
-                nActiveLeaves, rawPtr(d_activeLeaves),
-                rawPtr(s.jlist), rawPtr(s.jcount),
-                rawPtr(s.overflow));
-            checkGpuErrors(cudaGetLastError());
+            // hmax has just been refreshed for the leaves still iterating; the lists
+            // are rebuilt for ALL leaves, because CSR offsets shift as soon as any
+            // count changes.  Lists of converged leaves are built but not read.
+            buildJLeafListsCSR<false>(s, nullptr);
             HIP_CHECK(hipEventRecord(evJB1));
 
             if (mode == KernelMode::WARP_PER_LEAF)
@@ -789,7 +830,7 @@ DensTimings solveDensH(// Host input/output
                     rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh), rawPtr(d_converged),
                     nActiveLeaves, rawPtr(d_activeLeaves),
                     pmass,
-                    rawPtr(s.jcount), rawPtr(s.jlist),
+                    rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
                     rawPtr(s.layout));
             }
             else
@@ -800,7 +841,7 @@ DensTimings solveDensH(// Host input/output
                     nActive, rawPtr(d_activeParticles),
                     pmass,
                     rawPtr(s.particleLeaf),
-                    rawPtr(s.jcount), rawPtr(s.jlist),
+                    rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
                     rawPtr(s.layout));
             }
             checkGpuErrors(cudaGetLastError());
@@ -870,12 +911,14 @@ DensTimings solveDensH(// Host input/output
     // rebuild them for EVERY leaf at the converged h before sweeping all particles
     // once.  That full-tree hmax pass is also what the force walk relies on.
     // ---------------------------------------------------------------
-    thrust::device_vector<double> d_divv, d_ddivvdt, d_dvdx;
+    auto& d_divv = s.divv;
+    auto& d_ddivvdt = s.ddivvdt;
+    auto& d_xi = s.xi;
     if (grads)
     {
         d_divv.resize(ngas);
         d_ddivvdt.resize(ngas);
-        d_dvdx.resize((size_t)9 * ngas);
+        d_xi.resize(ngas);
 
         cudaEvent_t evG0, evGJ, evG1;
         checkGpuErrors(hipEventCreate(&evG0));
@@ -892,14 +935,7 @@ DensTimings solveDensH(// Host input/output
             rawPtr(s.hmax_leaf));
         checkGpuErrors(cudaGetLastError());
 
-        buildJLeafListKernel<false><<<iceil(nActiveLeaves, 256), 256>>>(
-            rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), nullptr,
-            rawPtr(s.centers), rawPtr(s.sizes),
-            rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
-            nActiveLeaves, rawPtr(d_activeLeaves),
-            rawPtr(s.jlist), rawPtr(s.jcount),
-            rawPtr(s.overflow));
-        checkGpuErrors(cudaGetLastError());
+        buildJLeafListsCSR<false>(s, nullptr);
         HIP_CHECK(hipEventRecord(evGJ));
 
         sphGradientsKernel<<<iceil(ngas, 256), 256>>>(
@@ -907,10 +943,10 @@ DensTimings solveDensH(// Host input/output
             rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
             rawPtr(d_ax), rawPtr(d_ay), rawPtr(d_az),
             rawPtr(s.h), rawPtr(s.rho), rawPtr(s.gradh),
-            rawPtr(d_divv), rawPtr(d_dvdx), rawPtr(d_ddivvdt),
+            rawPtr(d_divv), rawPtr(d_xi), rawPtr(d_ddivvdt),
             ngas, pmass,
             rawPtr(s.particleLeaf),
-            rawPtr(s.jcount), rawPtr(s.jlist),
+            rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
             rawPtr(s.layout));
         checkGpuErrors(cudaGetLastError());
 
@@ -929,13 +965,14 @@ DensTimings solveDensH(// Host input/output
     // to phantom's order with s.order (sorted index -> original index).
     HIP_CHECK(hipEventRecord(evDl0));
     {
-        thrust::device_vector<double> d_out(ngas);
+        auto& d_out = s.dStage;
+        d_out.resize(ngas);
         thrust::scatter(s.h.begin(),     s.h.end(),     s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(h_host.data(),     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(h_host,     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         thrust::scatter(s.rho.begin(),   s.rho.end(),   s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(rho_host.data(),   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(rho_host,   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         thrust::scatter(s.gradh.begin(), s.gradh.end(), s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(gradh_host.data(), rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(gradh_host, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
 
         if (grads)
         {
@@ -944,12 +981,8 @@ DensTimings solveDensH(// Host input/output
             thrust::scatter(d_ddivvdt.begin(), d_ddivvdt.end(), s.order.begin(), d_out.begin());
             HIP_CHECK(hipMemcpy(grads->ddivvdt, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
 
-            thrust::device_vector<double> d_dvdxOut((size_t)9 * ngas);
-            scatterDvdxKernel<<<iceil(ngas, 256), 256>>>(
-                rawPtr(d_dvdx), rawPtr(s.order), rawPtr(d_dvdxOut), ngas);
-            checkGpuErrors(cudaGetLastError());
-            HIP_CHECK(hipMemcpy(grads->dvdx, rawPtr(d_dvdxOut),
-                                (size_t)9*ngas*sizeof(double), hipMemcpyDeviceToHost));
+            thrust::scatter(d_xi.begin(), d_xi.end(), s.order.begin(), d_out.begin());
+            HIP_CHECK(hipMemcpy(grads->xi, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         }
     }
     HIP_CHECK(hipEventRecord(evDl1));

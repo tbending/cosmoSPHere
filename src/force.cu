@@ -68,17 +68,7 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
     // of 2*hmax_i, tested as a Euclidean distance between the raw boxes rather than
     // inflate-and-overlap.  Overwrites the gather lists.
     // -----------------------------------------------------------------------
-    thrust::device_vector<int> d_allLeaves(s.nLeaves);
-    thrust::sequence(d_allLeaves.begin(), d_allLeaves.end());
-
-    buildJLeafListKernel<true><<<iceil(s.nLeaves, 256), 256>>>(
-        rawPtr(s.leafToInternal), rawPtr(s.hmax_leaf), rawPtr(s.hmax_node),
-        rawPtr(s.centers), rawPtr(s.sizes),
-        rawPtr(s.octree.childOffsets), rawPtr(s.octree.internalToLeaf),
-        s.nLeaves, rawPtr(d_allLeaves),
-        rawPtr(s.jlist), rawPtr(s.jcount),
-        rawPtr(s.overflow));
-    checkGpuErrors(cudaGetLastError());
+    buildJLeafListsCSR<true>(s, rawPtr(s.hmax_node));
 
     HIP_CHECK(hipEventRecord(e2));
     checkGpuErrors(hipEventSynchronize(e2));
@@ -89,8 +79,8 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft)
 
     s.jlistToken = s.token;
 
-    // The symmetric radius makes the lists longer, so a truncation that never fired
-    // for gather could fire here.  Silent truncation loses neighbours — make it loud.
+    // Under CSR a list cannot truncate, and the stack can only drop subtrees on a
+    // pathological tree; either would lose neighbours silently, so make it loud.
     int ovf[2] = {0, 0};
     HIP_CHECK(hipMemcpy(ovf, rawPtr(s.overflow), 2*sizeof(int), hipMemcpyDeviceToHost));
     if (ovf[0] > 0 || ovf[1] > 0)
@@ -125,6 +115,7 @@ __global__ void sphForceKernelJList(
     double beta,
     double alphau,
     const int* __restrict__ particleLeaf,
+    const int* __restrict__ jOffset,
     const int* __restrict__ jcount,
     const int* __restrict__ jlist,
     const unsigned* __restrict__ layout)
@@ -180,7 +171,7 @@ __global__ void sphForceKernelJList(
     double divv_s    = 0.0;
 
     const int iLeaf = particleLeaf[i];
-    const int jBase = iLeaf * MAX_J_PER_LEAF;
+    const int jBase = jOffset[iLeaf];
     const int nj    = jcount[iLeaf];
 
     for (int jl = 0; jl < nj; ++jl)
@@ -253,17 +244,8 @@ __global__ void sphForceKernelJList(
                 qij = sqrt(qij2);
                 sph::m4_kern(qij, wij, grwij);
 
-                // div v, as in sphGradientsKernel
-                const double rij1_divv       = 1.0 / (dr + 2.220446049250313e-16);
-                const double rij1grkern_divv = rij1_divv * grwij;
-
-                const double runix_divv = dx * rij1grkern_divv * pmass;
-                const double runiy_divv = dy * rij1grkern_divv * pmass;
-                const double runiz_divv = dz * rij1grkern_divv * pmass;
-
-                divv_s += dvxij * runix_divv
-                        + dvyij * runiy_divv
-                        + dvzij * runiz_divv;
+                // div v: projv is already (v_i - v_j) . r_ij / |r_ij|
+                divv_s += pmass * grwij * projv;
 
                 const double gradkerni = grwij * hfacgrkerni;   // F_ij(h_i) / omega_i
 
@@ -330,49 +312,79 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
 
     buildForceJLeafList(s, ft);
 
-    // phantom order -> Hilbert order (s.order maps sorted index -> phantom index)
-    auto upload = [&](const double* host)
-    {
-        thrust::device_vector<double> phantomOrder(host, host + n);
-        thrust::device_vector<double> sorted(n);
-        thrust::gather(s.order.begin(), s.order.end(), phantomOrder.begin(), sorted.begin());
-        return sorted;
-    };
-    thrust::device_vector<double> d_x  = upload(f.x),  d_y  = upload(f.y),  d_z  = upload(f.z);
-    thrust::device_vector<double> d_h  = upload(f.h);
-    thrust::device_vector<double> d_vx = upload(f.vx), d_vy = upload(f.vy), d_vz = upload(f.vz);
-    thrust::device_vector<double> d_pro2    = upload(f.pro2);
-    thrust::device_vector<double> d_spsound = upload(f.spsound);
-    thrust::device_vector<double> d_alphaAV = upload(f.alphaAV);
-    thrust::device_vector<double> d_u       = upload(f.u);
+    // Phase boundaries on the device timeline, like buildForceJLeafList: recording
+    // an event does not synchronise, so timing does not perturb what it measures.
+    cudaEvent_t e0, e1, e2, e3;
+    for (auto* e : {&e0, &e1, &e2, &e3}) checkGpuErrors(hipEventCreate(e));
+    HIP_CHECK(hipEventRecord(e0));
 
-    thrust::device_vector<double> d_fx(n, 0.0), d_fy(n, 0.0), d_fz(n, 0.0), d_f4(n, 0.0);
-    thrust::device_vector<double> d_vsigmax(n, 0.0), d_divv(n, 0.0);
+    // Every device buffer lives in GpuState and is resized to n, a no-op after the first
+    // call, so a force pass allocates nothing on the device.
+    const size_t nbytes = static_cast<size_t>(n) * sizeof(double);
+    s.fStage.resize(n);
+
+    // phantom order -> Hilbert order (s.order maps sorted index -> phantom index)
+    auto upload = [&](const double* host, thrust::device_vector<double>& sorted)
+    {
+        HIP_CHECK(hipMemcpy(rawPtr(s.fStage), host, nbytes, hipMemcpyHostToDevice));
+        sorted.resize(n);
+        thrust::gather(s.order.begin(), s.order.end(), s.fStage.begin(), sorted.begin());
+    };
+    // Positions and h: the solve's Hilbert-sorted copies are exactly what phantom holds
+    // -- the positions it uploaded and the converged h it stored back -- and phantom
+    // only calls force again on the same tree when positions have not moved.
+    // Velocities: the solve's copies serve the first force pass after it; a later one is
+    // the corrector, with new velocities (see GpuState::forceToken).
+    const bool refreshV = (s.forceToken == s.token) || (int)s.vx.size() != n;
+    if (refreshV)
+    {
+        upload(f.vx, s.vx);
+        upload(f.vy, s.vy);
+        upload(f.vz, s.vz);
+    }
+    s.forceToken = s.token;
+
+    upload(f.pro2,    s.pro2);
+    upload(f.spsound, s.spsound);
+    upload(f.alphaAV, s.alphaAV);
+    upload(f.u,       s.u);
+
+    // Not zeroed: the kernel writes all n entries of every output, dead particles included.
+    for (auto* v : {&s.fx, &s.fy, &s.fz, &s.f4, &s.vsigmax, &s.divvF}) v->resize(n);
+    HIP_CHECK(hipEventRecord(e1));
 
     sphForceKernelJList<<<iceil(n, 256), 256>>>(
-        rawPtr(d_x), rawPtr(d_y), rawPtr(d_z),
-        rawPtr(d_vx), rawPtr(d_vy), rawPtr(d_vz),
-        rawPtr(d_h), rawPtr(s.gradh),
-        rawPtr(d_pro2), rawPtr(d_spsound), rawPtr(d_alphaAV), rawPtr(d_u),
-        rawPtr(d_fx), rawPtr(d_fy), rawPtr(d_fz), rawPtr(d_f4),
-        rawPtr(d_vsigmax), rawPtr(d_divv),
+        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+        rawPtr(s.vx), rawPtr(s.vy), rawPtr(s.vz),
+        rawPtr(s.h), rawPtr(s.gradh),
+        rawPtr(s.pro2), rawPtr(s.spsound), rawPtr(s.alphaAV), rawPtr(s.u),
+        rawPtr(s.fx), rawPtr(s.fy), rawPtr(s.fz), rawPtr(s.f4),
+        rawPtr(s.vsigmax), rawPtr(s.divvF),
         n, pmass, beta, alphau,
-        rawPtr(s.particleLeaf), rawPtr(s.jcount), rawPtr(s.jlist), rawPtr(s.layout));
+        rawPtr(s.particleLeaf), rawPtr(s.jOffset), rawPtr(s.jcount), rawPtr(s.jlist),
+        rawPtr(s.layout));
     checkGpuErrors(cudaGetLastError());
+    HIP_CHECK(hipEventRecord(e2));
     HIP_CHECK(hipDeviceSynchronize());
 
     // Hilbert order -> phantom order, then to the host
-    thrust::device_vector<double> d_out(n);
     auto download = [&](const thrust::device_vector<double>& sorted, double* host)
     {
-        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(host, rawPtr(d_out), static_cast<size_t>(n) * sizeof(double),
-                            hipMemcpyDeviceToHost));
+        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), s.fStage.begin());
+        HIP_CHECK(hipMemcpy(host, rawPtr(s.fStage), nbytes, hipMemcpyDeviceToHost));
     };
-    download(d_fx, f.fx);
-    download(d_fy, f.fy);
-    download(d_fz, f.fz);
-    download(d_f4, f.f4);
-    download(d_vsigmax, f.vsigmax);
-    download(d_divv, f.divv);
+    download(s.fx, f.fx);
+    download(s.fy, f.fy);
+    download(s.fz, f.fz);
+    download(s.f4, f.f4);
+    download(s.vsigmax, f.vsigmax);
+    download(s.divvF, f.divv);
+
+    HIP_CHECK(hipEventRecord(e3));
+    checkGpuErrors(hipEventSynchronize(e3));
+    float ms = 0;
+    HIP_CHECK(hipEventElapsedTime(&ms, e0, e1)); ft.upload   = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, e1, e2)); ft.kernel   = ms * 1e-3;
+    HIP_CHECK(hipEventElapsedTime(&ms, e2, e3)); ft.download = ms * 1e-3;
+    for (auto* e : {&e0, &e1, &e2, &e3}) HIP_CHECK(hipEventDestroy(*e));
 }

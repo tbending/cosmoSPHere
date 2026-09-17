@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <vector>
 
+#include <thrust/binary_search.h>
 #include <thrust/execution_policy.h>
 #include <thrust/extrema.h>
 #include <thrust/gather.h>
@@ -62,20 +63,30 @@ void buildTree(GpuState& s,
     // -----------------------------------------------------------------------
     // Hilbert keys + GPU sort
     // -----------------------------------------------------------------------
-    thrust::device_vector<uint64_t> d_keys(ngas);
+    // Keys and the gather scratch live in `s`, so a tree build allocates no particle-
+    // sized buffers.  The sorted arrays are swapped with sortTmp, both persistent.
+    auto& d_keys = s.keys;
+    d_keys.resize(ngas);
 
     constexpr int BLK = 256;
     computeHilbertKeysKernel<<<iceil(ngas, BLK), BLK>>>(
-        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z),
+        rawPtr(s.x), rawPtr(s.y), rawPtr(s.z), rawPtr(s.h),
         rawPtr(d_keys), ngas, s.box);
     checkGpuErrors(cudaGetLastError());
 
-    // Sort permutation by Hilbert key, then gather particle data.
+    // Sort permutation by Hilbert key, then gather particle data.  Dead particles carry
+    // the maximum key, so this same sort parks them at the end.
     s.order.resize(ngas);
     thrust::sequence(s.order.begin(), s.order.end());
     thrust::sort_by_key(d_keys.begin(), d_keys.end(), s.order.begin());
 
-    thrust::device_vector<double> d_tmp(ngas);
+    // Live prefix: everything before the first maximum key.  The gathers below still
+    // cover all ngas, so the dead tail keeps its own data; only the TREE is restricted.
+    s.nAlive = (int)(thrust::lower_bound(thrust::device, d_keys.begin(), d_keys.end(),
+                                         ~uint64_t(0)) - d_keys.begin());
+
+    auto& d_tmp = s.sortTmp;
+    d_tmp.resize(ngas);
     for (auto* v : {&s.x, &s.y, &s.z, &s.h})
     {
         thrust::gather(s.order.begin(), s.order.end(), v->begin(), d_tmp.begin());
@@ -92,12 +103,12 @@ void buildTree(GpuState& s,
     // Cornerstone leaf tree + fully linked internal tree
     // -----------------------------------------------------------------------
     thrust::device_vector<uint64_t>      csTree = std::vector<uint64_t>{0, nodeRange<uint64_t>(0)};
-    thrust::device_vector<unsigned>      counts = std::vector<unsigned>{(unsigned)ngas};
+    thrust::device_vector<unsigned>      counts = std::vector<unsigned>{(unsigned)s.nAlive};
     thrust::device_vector<uint64_t>      tmpTree;
     thrust::device_vector<TreeNodeIndex> workArray;
 
     // d_keys is already sorted — run update until the leaf partition is stable.
-    while (!updateOctreeGpu(rawPtr(d_keys), rawPtr(d_keys) + ngas,
+    while (!updateOctreeGpu(rawPtr(d_keys), rawPtr(d_keys) + s.nAlive,
                             BUCKET_SIZE, csTree, counts, tmpTree, workArray))
     {
         // iterate until stable leaf partition
@@ -110,10 +121,15 @@ void buildTree(GpuState& s,
     // Particle layout (prefix-sum of counts → first particle of each leaf).
     s.nLeaves  = (int)nNodes(csTree);
     s.numNodes = s.octree.numNodes;
+    // layout[0] = 0, layout[L+1] = counts[0] + ... + counts[L].  counts has exactly
+    // nLeaves entries: scanning to counts.end() + 1, as this used to, read one element
+    // past the end on the device -- harmless while the next page happened to be mapped,
+    // an illegal-address fault when it was not.
     s.layout.resize(s.nLeaves + 1);
-    thrust::exclusive_scan(thrust::device,
-                           counts.begin(), counts.end() + 1,
-                           s.layout.begin(), 0u);
+    s.layout[0] = 0u;
+    thrust::inclusive_scan(thrust::device,
+                           counts.begin(), counts.end(),
+                           s.layout.begin() + 1);
     HIP_CHECK(hipEventRecord(e3));
 
     // -----------------------------------------------------------------------
@@ -137,15 +153,18 @@ void buildTree(GpuState& s,
         s.numNodes, rawPtr(s.leafToInternal));
     checkGpuErrors(cudaGetLastError());
 
-    s.particleLeaf.resize(ngas);
+    s.particleLeaf.resize(ngas);   // entries past nAlive are never set and never read
     buildParticleToLeafKernel<<<iceil(s.nLeaves, 256), 256>>>(
         rawPtr(s.layout), s.nLeaves, rawPtr(s.particleLeaf));
     checkGpuErrors(cudaGetLastError());
 
     // Storage for the walk. Reused across calls; every entry is written before use.
+    // jlist itself is sized by buildJLeafListsCSR, from the counts.
     s.hmax_leaf.resize(s.nLeaves);
-    s.jlist.resize((size_t)s.nLeaves * MAX_J_PER_LEAF);
     s.jcount.resize(s.nLeaves);
+    s.jOffset.resize(s.nLeaves + 1);
+    s.allLeaves.resize(s.nLeaves);
+    thrust::sequence(s.allLeaves.begin(), s.allLeaves.end());
     s.overflow.assign(2, 0);
     HIP_CHECK(hipEventRecord(e4));
     checkGpuErrors(hipEventSynchronize(e4));

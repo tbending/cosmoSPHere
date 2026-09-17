@@ -19,15 +19,18 @@ struct ForceTimings
 {
     double hmaxUpsweep = 0.0;
     double jleafBuild  = 0.0;
+    double upload      = 0.0;   // host -> device copies and gathers into Hilbert order
+    double kernel      = 0.0;   // sphForceKernelJList
+    double download    = 0.0;   // scatters back to phantom order and device -> host copies
 };
 
 // Host arrays for one force pass, in phantom order, all length n.  Raw pointers rather
 // than std::vector, as for GradFields: they come straight from Fortran through the C API.
+// Positions and h are not here: the force pass uses the solve's copies in GpuState.
 struct ForceFields
 {
     // inputs
-    const double* x;  const double* y;  const double* z;  const double* h;
-    const double* vx; const double* vy; const double* vz;
+    const double* vx; const double* vy; const double* vz;   // read on the corrector only
     const double* pro2;      // P / rho^2
     const double* spsound;   // sound speed
     const double* alphaAV;   // artificial viscosity alpha
@@ -49,13 +52,13 @@ struct ForceFields
  * Requires s.hmax_leaf valid for EVERY leaf at the converged h — the full-tree pass
  * at the top of solveDensH's gradient sweep leaves it that way.  Propagates it to
  * every node (hmax cannot be derived from an SFC key the way node geometry can) and
- * overwrites s.jlist / s.jcount.
+ * overwrites s.jlist / s.jcount / s.jOffset.
  *
  * Measured on sedov (176900 particles, 41 dumps to t=0.1): 0% larger than the gather
  * list at uniform ICs, ~7% once the blast develops, peaking at 8.3%.  It stays small
  * because leaf size and h are both set by local density, so 2h is ~1 leaf width
- * everywhere and a big-h leaf is also a big leaf.  Longest list seen: 433 against
- * MAX_J_PER_LEAF = 1024.
+ * everywhere and a big-h leaf is also a big leaf.  Longest list seen on sedov: 433
+ * j-leaves; the torus reached 1494.
  */
 void buildForceJLeafList(GpuState& s, ForceTimings& ft);
 
@@ -64,8 +67,10 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft);
  *
  * Rebuilds the symmetric j-leaf lists if the tree has changed, uploads the inputs and
  * gathers them into Hilbert order, runs the force kernel, and scatters the outputs back
- * to phantom order.  Requires a density solve for the same particle set
- * (GpuState::readyForForce).
+ * to phantom order.  Positions and h are taken from the solve's copies in the state, and
+ * velocities uploaded only when they may have changed since the solve.  Requires a
+ * density solve for the same particle set (GpuState::readyForForce), with positions not
+ * moved since it.
  */
 void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
                    double alphau, ForceTimings& ft);

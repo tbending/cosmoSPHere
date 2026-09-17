@@ -1,10 +1,9 @@
 /*
  * dens_c_api.cu — C-linkage entry point for the Cornerstone GPU density solver.
  *
- * Phantom's Fortran code cannot call solveDensH() directly (it takes
- * std::vector arguments).  This thin wrapper accepts flat C arrays,
- * copies them into the vectors solveDensH() expects, and writes back
- * the results.
+ * C linkage for solveDensH().  Every array goes straight through: inputs are
+ * uploaded from the caller's arrays and results are written into them by the
+ * device copies, so nothing is staged here.
  *
  * Outputs (all arrays length n unless noted):
  *   h        — converged smoothing lengths (in/out, updated in-place)
@@ -14,8 +13,8 @@
  *              gpu_dens_iface.F90 performs that conversion, and needs rho
  *              in order to do it.
  *   divv     — div v (out)
- *   dvdx     — velocity gradient tensor, 9*n, laid out to match Fortran's
- *              dvdx(1:9,i), i.e. dvdx[9*i + c] (out)
+ *   xi       — Cullen & Dehnen xi limiter (out), formed on the device from
+ *              the velocity gradient tensor, which is not returned
  *   ddivvdt  — d(div v)/dt for the Cullen & Dehnen switch (out)
  *
  * The last three replace the CPU densityiterate(icall=3) sweep that the
@@ -30,10 +29,13 @@
  */
 
 #include "density.hpp"
+#include "gpu_check.hpp"
+#include "util/cuda_utils.hpp"
 
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 extern "C" void densityiterate_gpu_c(
@@ -41,7 +43,7 @@ extern "C" void densityiterate_gpu_c(
     double*       rho,       // out:    density
     double*       gradh_out, // out:    d(rho)/d(h) normalised
     double*       divv,      // out:    div v
-    double*       dvdx,      // out:    velocity gradient tensor, 9*n
+    double*       xi,        // out:    xi limiter
     double*       ddivvdt,   // out:    d(div v)/dt
     const double* x,
     const double* y,
@@ -61,28 +63,34 @@ extern "C" void densityiterate_gpu_c(
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
 
-    std::vector<double> h_vec(h, h + n);
-    std::vector<double> rho_vec(n, 0.0);
-    std::vector<double> gradh_vec(n, 0.0);
-    const std::vector<double> x_vec(x, x + n);
-    const std::vector<double> y_vec(y, y + n);
-    const std::vector<double> z_vec(z, z + n);
-
-    // Velocities, accelerations and the gradient outputs go straight through as
-    // raw pointers — they are already flat arrays, so there is nothing to copy.
-    GradFields grads{vx, vy, vz, ax, ay, az, divv, dvdx, ddivvdt};
+    GradFields grads{vx, vy, vz, ax, ay, az, divv, xi, ddivvdt};
 
     auto t1 = clk::now();
-    DensTimings t = solveDensH(h_vec, rho_vec, gradh_vec, x_vec, y_vec, z_vec, pmass,
+    DensTimings t = solveDensH(h, rho, gradh_out, x, y, z, n, pmass,
                                KernelMode::FLAT_PARTICLE, &grads);
     auto t2 = clk::now();
 
-    for (int i = 0; i < n; ++i) {
-        h[i]         = h_vec[i];
-        rho[i]       = rho_vec[i];
-        gradh_out[i] = gradh_vec[i];
+    // COSMO_MEM: one line per run with device memory in use and the host high-water
+    // mark, taken after the first solve, so the largest problem that fits on a given
+    // card can be extrapolated from a small run.
+    static bool memReported = false;
+    if (!memReported && std::getenv("COSMO_MEM"))
+    {
+        memReported = true;
+        size_t freeB = 0, totalB = 0;
+        HIP_CHECK(hipMemGetInfo(&freeB, &totalB));
+        long hwmKB = 0;
+        if (FILE* fp = std::fopen("/proc/self/status", "r"))
+        {
+            char line[256];
+            while (std::fgets(line, sizeof line, fp))
+                if (std::strncmp(line, "VmHWM:", 6) == 0) { std::sscanf(line + 6, "%ld", &hwmKB); break; }
+            std::fclose(fp);
+        }
+        std::fprintf(stderr,
+            "COSMO_MEM n=%d device_used=%.2f GB of %.2f GB (%.0f bytes/particle) host_peak=%.2f GB\n",
+            n, (totalB - freeB) / 1e9, totalB / 1e9, double(totalB - freeB) / n, hwmKB / 1e6);
     }
-    auto t3 = clk::now();
 
     if (stats) {
         auto ms = [](clk::time_point a, clk::time_point b) {
@@ -96,11 +104,11 @@ extern "C" void densityiterate_gpu_c(
             "COSMO_STATS n=%d leaves=%d iters=%d | vecin=%.2f upload=%.2f bbox=%.2f "
             "keysort=%.2f tree=%.2f nodes=%.2f jbuild=%.2f nrkern=%.2f gjbuild=%.2f "
             "gradkern=%.2f download=%.2f | gpusum=%.2f "
-            "solve=%.2f unaccounted=%.2f vecout=%.2f total=%.2f\n",
+            "solve=%.2f unaccounted=%.2f total=%.2f\n",
             t.nParticles, t.nLeavesOut, t.itersRun,
             ms(t0, t1), 1e3*t.upload, 1e3*t.bboxAndSetup, 1e3*t.keysAndSort,
             1e3*t.treeBuild, 1e3*t.nodeCenters, 1e3*t.jleafBuild, 1e3*t.densKernel,
             1e3*t.gradJleafBuild, 1e3*t.gradKernel, 1e3*t.download,
-            gpu, solve, solve - gpu, ms(t2, t3), ms(t0, t3));
+            gpu, solve, solve - gpu, ms(t0, t2));
     }
 }

@@ -3,8 +3,8 @@
  *
  * Mirrors phantom's structure: densityiterate and force are two separate calls
  * (deriv.F90 :139 and :195), so this is its own entry point.  It rebuilds no tree:
- * the Hilbert ordering, gradh and the leaf bookkeeping were left in gpuState() by
- * densityiterate_gpu_c.  The work is done by computeForces (force.cu).
+ * the Hilbert ordering, positions, h, gradh and the leaf bookkeeping were left in
+ * gpuState() by densityiterate_gpu_c.  The work is done by computeForces (force.cu).
  *
  * PARTICLE ORDERING — read before adding an argument (applies in computeForces).
  * Phantom's arrays are in phantom's order; everything in the state is Hilbert-sorted.
@@ -19,16 +19,13 @@
 #include "force.hpp"
 #include "gpu_state.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
 extern "C" void force_gpu_c(
     int n,
     double pmass,
-    const double* x,
-    const double* y,
-    const double* z,
-    const double* h,
     const double* vx,
     const double* vy,
     const double* vz,
@@ -45,6 +42,8 @@ extern "C" void force_gpu_c(
     double* vsigmax,
     double* divv)
 {
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
     GpuState& s = gpuState();
 
     // Refuse rather than run on an absent or mismatched tree.  Repeated calls on the
@@ -58,17 +57,25 @@ extern "C" void force_gpu_c(
         std::abort();
     }
 
-    ForceFields f{x, y, z, h, vx, vy, vz, pro2, spsound, alphaAV, u,
+    ForceFields f{vx, vy, vz, pro2, spsound, alphaAV, u,
                   fx, fy, fz, f4, vsigmax, divv};
     ForceTimings ft;
     computeForces(s, f, pmass, beta, alphau, ft);
 
     // Same env gate as the density solve, so one setting shows the whole picture.
+    // wall is measured on the host around the whole call; wall - gpusum is host-side
+    // cost that none of the device phases see (allocation, vector construction).
     static const bool stats = (std::getenv("COSMO_DENS_STATS") != nullptr);
     if (stats)
+    {
+        const double wall = std::chrono::duration<double>(clk::now() - t0).count();
+        const double gpu  = ft.hmaxUpsweep + ft.jleafBuild + ft.upload + ft.kernel + ft.download;
         std::fprintf(stderr, "COSMO_FORCE n=%d leaves=%d | upsweep=%.2f jbuild=%.2f "
-                             "total=%.2f\n",
+                             "upload=%.2f kernel=%.2f download=%.2f | gpusum=%.2f "
+                             "wall=%.2f unaccounted=%.2f\n",
                      s.ngas, s.nLeaves,
                      1e3*ft.hmaxUpsweep, 1e3*ft.jleafBuild,
-                     1e3*(ft.hmaxUpsweep + ft.jleafBuild));
+                     1e3*ft.upload, 1e3*ft.kernel, 1e3*ft.download,
+                     1e3*gpu, 1e3*wall, 1e3*(wall - gpu));
+    }
 }
