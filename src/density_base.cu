@@ -946,9 +946,9 @@ DensTimings solveDensH(// Host input/output
         if (sph::radkernel * hmax >= 0.5 * lmin)
         {
             std::fprintf(stderr,
-                "FATAL: solveDensH: kernel support 2h = %g reaches half the periodic box "
+                "FATAL: solveDensH: kernel support %gh = %g reaches half the periodic box "
                 "(smallest side %g); too few particles for this box\n",
-                sph::radkernel * hmax, lmin);
+                sph::radkernel, sph::radkernel * hmax, lmin);
             std::abort();
         }
     }

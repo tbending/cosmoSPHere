@@ -8,7 +8,8 @@ drop-in replacement for its CPU tree, but also usable standalone for benchmarkin
 
 ## Requirements
 
-- AMD GPU with ROCm / `hipcc` (tested on MI300X, architecture `gfx942`)
+- An NVIDIA GPU with CUDA / `nvcc` (the default backend; tested on A100 and GH200), or an
+  AMD GPU with ROCm / `hipcc` (`GPU_BACKEND=hip`; tested on MI300A, architecture `gfx942`)
 - Cornerstone octree source tree (see below)
 
 ## Getting the code
@@ -31,8 +32,12 @@ git clone https://github.com/exafmm/cornerstone-octree octree-miniapp
 
 ```bash
 cd cosmoSPHere
-make CORNERSTONE_DIR=../cornerstone
+make CORNERSTONE_DIR=../cornerstone                    # CUDA
+make CORNERSTONE_DIR=../cornerstone GPU_BACKEND=hip    # AMD
 ```
+
+Phantom builds the library itself (`make GPU=yes GPU_TARGET=...`), passing the backend,
+architecture and kernel.
 
 This produces two binaries in `build/`:
 
@@ -46,8 +51,11 @@ This produces two binaries in `build/`:
 | Variable | Default | Description |
 |---|---|---|
 | `CORNERSTONE_DIR` | `../octree-miniapp` | Path to the octree-miniapp directory |
+| `GPU_BACKEND` | `cuda` | `cuda` or `hip` |
+| `CUDA_ARCH` | `80` | CUDA compute capabilities, space-separated |
 | `HIP_ARCH` | `gfx942` | AMD GPU target architecture |
-| `HIPCC` | `hipcc` | HIP compiler |
+| `GPUCC` | `nvcc` / `hipcc` | Compiler override |
+| `KERNEL` | `cubic` | `cubic` or `quintic` (the unrolled binary is cubic-only) |
 
 ## Running
 
