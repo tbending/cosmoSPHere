@@ -19,6 +19,8 @@
 
 CORNERSTONE_DIR ?= ../octree-miniapp
 GPU_BACKEND     ?= cuda
+# name of the Phantom GPU_TARGET profile this was built for (informational only)
+GPU_TARGET      ?=
 BUILDDIR := build
 # Ensure the build output directory exists (a fresh clone has no build/).
 $(shell mkdir -p $(BUILDDIR))
@@ -92,7 +94,22 @@ endif
 # Contains the density solver core + the Fortran-callable C API wrapper.
 # Phantom links with: -L<cosmoSPHere>/build -lcosmoSPHere
 # ---------------------------------------------------------------------------
-lib: $(BUILDDIR)/libcosmoSPHere.a
+lib: announce $(BUILDDIR)/libcosmoSPHere.a
+
+.PHONY: announce
+announce:
+	@echo ""
+	@echo "Compiling cosmoSPHere for $(GPU_TARGET) system..........."
+	@echo ""
+	@echo "Using $(GPU_BACKEND) backend"
+	@echo "Using $(KERNEL) kernel"
+ifeq ($(GPU_BACKEND),cuda)
+	@echo "CUDA_ARCH is $(CUDA_ARCH)"
+else
+	@echo "HIP_ARCH is $(HIP_ARCH)"
+endif
+	@echo "Using the Cornerstone octree from octree-miniapp (header-only: compiled as part of cosmoSPHere)"
+	@echo ""
 
 $(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/tree.o $(BUILDDIR)/force.o $(BUILDDIR)/gpu_state.o $(BUILDDIR)/dens_c_api.o $(BUILDDIR)/force_c_api.o $(BUILDDIR)/pin_c_api.o
 	ar rcs $@ $^
