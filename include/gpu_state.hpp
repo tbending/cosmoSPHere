@@ -94,6 +94,11 @@ struct GpuState
     // caller's back: the host decides the footprint, once, through cosmo_arrays_init.
     int sizedFor = 0;
 
+    // Seconds spent in cosmo_download since the last density solve.  The transfers
+    // moved out of the compute calls, so this is what COSMO_DENS_STATS reports as
+    // download=; solveDensH clears it.
+    double downloadSeconds = 0.0;
+
     int ngas     = 0;
     double hfact = 0.0;   // h-rho relation of the last density solve, for the force pass
     // Live particles (h > 0) form the prefix [0, nAlive) of the Hilbert order; dead

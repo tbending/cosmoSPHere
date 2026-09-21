@@ -37,13 +37,7 @@ extern "C" void force_gpu_c(
     double alphau,
     int disc_viscosity,   // nonzero: phantom's disc_viscosity form of the artificial viscosity
     int pdv_heating,      // phantom's ipdv_heating: 0 leaves p dV work out of du/dt
-    int shock_heating,    // phantom's ishock_heating: 0 leaves shock heating out of du/dt
-    double* fx,
-    double* fy,
-    double* fz,
-    double* f4,
-    double* vsigmax,
-    double* divv)
+    int shock_heating)    // phantom's ishock_heating: 0 leaves shock heating out of du/dt
 {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
@@ -72,8 +66,7 @@ extern "C" void force_gpu_c(
         std::abort();
     }
 
-    ForceFields f{vx, vy, vz, pro2, spsound, alphaAV, u,
-                  fx, fy, fz, f4, vsigmax, divv};
+    ForceFields f{vx, vy, vz, pro2, spsound, alphaAV, u};
     ForceTimings ft;
     computeForces(s, f, pmass, beta, alphau, disc_viscosity != 0,
                   pdv_heating > 0, shock_heating > 0, ft);

@@ -36,10 +36,7 @@ struct ForceFields
     const double* spsound;   // sound speed
     const double* alphaAV;   // artificial viscosity alpha
     const double* u;         // specific thermal energy
-    // outputs
-    double* fx; double* fy; double* fz; double* f4;   // fxyzu(1:4)
-    double* vsigmax;         // max signal speed over neighbours, for the Courant timestep
-    double* divv;            // div v
+    // Outputs are not here: the host fetches them with cosmo_download(COSMO_FORCE_OUT).
 };
 
 /*! @brief Rebuild the j-leaf lists with the SYMMETRIC (gather + scatter) criterion.

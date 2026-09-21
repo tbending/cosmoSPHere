@@ -67,14 +67,13 @@ struct GradFields
     // inputs
     const double* vx; const double* vy; const double* vz;   // velocity
     const double* ax; const double* ay; const double* az;   // acceleration (fxyzu+fext)
-    // outputs
-    double* divv;      // div v
-    double* xi;        // Cullen & Dehnen xi limiter, from the velocity gradient tensor
-    double* ddivvdt;   // d(div v)/dt, the Cullen & Dehnen switch source term
+    // Outputs are not here: the host fetches them with cosmo_download(COSMO_GRAD_OUT).
+    // Whether they are COMPUTED is still decided by whether grads is given at all.
 };
 
 // Solve for smoothing lengths h and densities rho for all particles.
-// h_host is in/out; rho_host and gradh_host are output-only.
+// h_host is an input, the starting guess; the converged h, rho and gradh are left on
+// the device for the host to fetch with cosmo_download.
 // x/y/z (n each) and pmass are read-only inputs.
 // mode selects the GPU density kernel (default: FLAT_PARTICLE).
 // grads is optional — see GradFields above.
@@ -87,9 +86,7 @@ struct GradFields
 //
 // Leaves the tree, the Hilbert-sorted particle data and the leaf bookkeeping in the
 // shared state, so a repeated solve reuses the allocations — see gpu_state.hpp.
-DensTimings solveDensH(double* h_host,
-                       double* rho_host,
-                       double* gradh_host,
+DensTimings solveDensH(const double* h_host,
                        const double* x_host,
                        const double* y_host,
                        const double* z_host,

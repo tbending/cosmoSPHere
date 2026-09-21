@@ -467,18 +467,8 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     HIP_CHECK(hipEventRecord(e2));
     HIP_CHECK(hipDeviceSynchronize());
 
-    // Hilbert order -> phantom order, then to the host
-    auto download = [&](const thrust::device_vector<double>& sorted, double* host)
-    {
-        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), s.fStage.begin());
-        HIP_CHECK(hipMemcpy(host, rawPtr(s.fStage), nbytes, hipMemcpyDeviceToHost));
-    };
-    download(s.fx, f.fx);
-    download(s.fy, f.fy);
-    download(s.fz, f.fz);
-    download(s.f4, f.f4);
-    download(s.vsigmax, f.vsigmax);
-    download(s.divvF, f.divv);
+    // Results stay on the device: the host fetches them with
+    // cosmo_download(COSMO_FORCE_OUT).
 
     HIP_CHECK(hipEventRecord(e3));
     checkGpuErrors(hipEventSynchronize(e3));

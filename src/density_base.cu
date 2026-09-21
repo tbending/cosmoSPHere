@@ -717,10 +717,8 @@ __global__ void sphGradientsKernel(
 // ---------------------------------------------------------------------------
 // Host driver: build the tree, solve for h, then sweep the gradients.
 // ---------------------------------------------------------------------------
-DensTimings solveDensH(// Host input/output
-                        double* h_host,
-                        double* rho_host,
-                        double* gradh_host,
+DensTimings solveDensH(// Host input
+                        const double* h_host,
                         // Host input (read-only)
                         const double* x_host,
                         const double* y_host,
@@ -1007,34 +1005,19 @@ DensTimings solveDensH(// Host input/output
     // Download — hipMemcpy so the transfers land on the default stream and are
     // correctly bracketed by the events.  Results are in Hilbert order; scatter back
     // to phantom's order with s.order (sorted index -> original index).
+    // Results stay on the device: the host fetches them with cosmo_download, which
+    // accumulates its own time into s.downloadSeconds for the stats line below.
     HIP_CHECK(hipEventRecord(evDl0));
-    {
-        auto& d_out = s.dStage;
-        thrust::scatter(s.h.begin(),     s.h.end(),     s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(h_host,     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-        thrust::scatter(s.rho.begin(),   s.rho.end(),   s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(rho_host,   rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-        thrust::scatter(s.gradh.begin(), s.gradh.end(), s.order.begin(), d_out.begin());
-        HIP_CHECK(hipMemcpy(gradh_host, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-
-        if (grads)
-        {
-            thrust::scatter(d_divv.begin(), d_divv.end(), s.order.begin(), d_out.begin());
-            HIP_CHECK(hipMemcpy(grads->divv, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-            thrust::scatter(d_ddivvdt.begin(), d_ddivvdt.end(), s.order.begin(), d_out.begin());
-            HIP_CHECK(hipMemcpy(grads->ddivvdt, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-
-            thrust::scatter(d_xi.begin(), d_xi.end(), s.order.begin(), d_out.begin());
-            HIP_CHECK(hipMemcpy(grads->xi, rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
-        }
-    }
     HIP_CHECK(hipEventRecord(evDl1));
     checkGpuErrors(hipEventSynchronize(evDl1));
 
     float ms = 0;
     HIP_CHECK(hipEventElapsedTime(&ms, evUpload0, evUpload1)); t.upload     = ms * 1e-3;
     HIP_CHECK(hipEventElapsedTime(&ms, ev3,       ev4));       t.densKernel = ms * 1e-3 - t.jleafBuild;
-    HIP_CHECK(hipEventElapsedTime(&ms, evDl0,     evDl1));     t.download   = ms * 1e-3;
+    // download= is the host-driven cosmo_download calls for the solve just finished;
+    // the ones for THIS solve have not happened yet, so report what the last one cost.
+    t.download = s.downloadSeconds;
+    s.downloadSeconds = 0.0;
 
     for (auto* e : {&evUpload0, &evUpload1, &ev3, &evJB0, &evJB1, &ev4, &evDl0, &evDl1})
         HIP_CHECK(hipEventDestroy(*e));

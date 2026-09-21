@@ -1,11 +1,15 @@
 # cosmoSPHere Makefile
 #
 # Targets:
-#   all                — build the standalone test binaries (default; the unrolled one is
-#                        cubic-only, so KERNEL=quintic builds density_hip alone)
-#   build/density_hip          — scalar inner j-loop
-#   build/density_hip_unrolled — 4x-unrolled inner j-loop
+#   lib                — the static library phantom links against (the only build)
 #   clean              — remove build products
+#
+# src/main.cu and src/density_unrolled.cu are NOT built.  They are the standalone
+# density_hip and density_hip_unrolled benchmarks -- a scalar and a 4x-unrolled inner
+# j-loop -- kept as a record of an idea that was not carried through.  They call
+# solveDensH with the signature it had before the host took over fetching results, so
+# they no longer compile; that is deliberate rather than an oversight.  Anyone reviving
+# them needs to fetch h, rho and gradh with cosmo_download.
 #
 # Configurable variables (override on command line or environment):
 #   CORNERSTONE_DIR  — path to cornerstone-octree source tree
@@ -83,11 +87,7 @@ $(shell [ "$$(cat $(TAGFILE) 2>/dev/null)" = "$(BUILD_TAG)" ] || printf '%s' "$(
 # ---------------------------------------------------------------------------
 .PHONY: all lib clean info
 
-ifeq ($(KERNEL),quintic)
-all: $(BUILDDIR)/density_hip
-else
-all: $(BUILDDIR)/density_hip $(BUILDDIR)/density_hip_unrolled
-endif
+all: lib
 
 # ---------------------------------------------------------------------------
 # Static library target — used when linking against Phantom (GPU=yes).
@@ -123,16 +123,6 @@ $(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu $(TAGFILE)
 $(BUILDDIR)/arrays_c_api.o: src/arrays_c_api.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/arrays_c_api.d -c -o $@ $<
 
-# Scalar (base) binary
-$(BUILDDIR)/density_hip: $(BUILDDIR)/main.base.o $(BUILDDIR)/density_base.o \
-                         $(BUILDDIR)/tree.o $(BUILDDIR)/gpu_state.o
-	$(GPUCC) $(GPU_FLAGS) -o $@ $^
-
-# 4x-unrolled binary
-$(BUILDDIR)/density_hip_unrolled: $(BUILDDIR)/main.unrolled.o $(BUILDDIR)/density_unrolled.o \
-                                  $(BUILDDIR)/gpu_state.o
-	$(GPUCC) $(GPU_FLAGS) -o $@ $^
-
 # Compile rules: each .cu in src/ becomes a .o in build/
 $(BUILDDIR)/tree.o: src/tree.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/tree.d -c -o $@ $<
@@ -148,17 +138,6 @@ $(BUILDDIR)/force_c_api.o: src/force_c_api.cu $(TAGFILE)
 
 $(BUILDDIR)/density_base.o: src/density_base.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/density_base.d -c -o $@ $<
-
-$(BUILDDIR)/density_unrolled.o: src/density_unrolled.cu $(TAGFILE)
-	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/density_unrolled.d -c -o $@ $<
-
-# main.cu compiled twice — once for each binary — so the banner can show the
-# correct kernel name.  For now both are identical; we use the same .cu file.
-$(BUILDDIR)/main.base.o: src/main.cu $(TAGFILE)
-	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/main.base.d -c -o $@ $<
-
-$(BUILDDIR)/main.unrolled.o: src/main.cu $(TAGFILE)
-	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/main.unrolled.d -c -o $@ $<
 
 -include $(BUILDDIR)/*.d
 
