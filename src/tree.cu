@@ -78,7 +78,6 @@ void buildTree(GpuState& s,
     // Keys and the gather scratch live in `s`, so a tree build allocates no particle-
     // sized buffers.  The sorted arrays are swapped with sortTmp, both persistent.
     auto& d_keys = s.keys;
-    d_keys.resize(ngas);
 
     constexpr int BLK = 256;
     computeHilbertKeysKernel<<<iceil(ngas, BLK), BLK>>>(
@@ -88,7 +87,6 @@ void buildTree(GpuState& s,
 
     // Sort permutation by Hilbert key, then gather particle data.  Dead particles carry
     // the maximum key, so this same sort parks them at the end.
-    s.order.resize(ngas);
     thrust::sequence(s.order.begin(), s.order.end());
     thrust::sort_by_key(d_keys.begin(), d_keys.end(), s.order.begin());
 
@@ -98,7 +96,6 @@ void buildTree(GpuState& s,
                                          ~uint64_t(0)) - d_keys.begin());
 
     auto& d_tmp = s.sortTmp;
-    d_tmp.resize(ngas);
     for (auto* v : {&s.x, &s.y, &s.z, &s.h})
     {
         thrust::gather(s.order.begin(), s.order.end(), v->begin(), d_tmp.begin());
@@ -177,7 +174,8 @@ void buildTree(GpuState& s,
         s.numNodes, rawPtr(s.leafToInternal));
     checkGpuErrors(cudaGetLastError());
 
-    s.particleLeaf.resize(ngas);   // entries past nAlive are never set and never read
+    // particleLeaf is sized by cosmo_arrays_init; entries past nAlive are never set,
+    // and never read
     buildParticleToLeafKernel<<<iceil(s.nLeaves, 256), 256>>>(
         rawPtr(s.layout), s.nLeaves, rawPtr(s.particleLeaf));
     checkGpuErrors(cudaGetLastError());

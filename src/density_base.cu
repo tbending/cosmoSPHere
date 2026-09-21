@@ -762,7 +762,6 @@ DensTimings solveDensH(// Host input/output
     s.gradh.assign(ngas, 0.0);
     // Scratch lives in `s` and is resized, not reallocated, on each solve.
     auto& d_converged = s.converged;
-    d_converged.resize(ngas);
     thrust::fill(d_converged.begin(), d_converged.end(), 0);
 
     // Velocity and acceleration are only needed for the gradient sweep.  Velocity
@@ -804,10 +803,7 @@ DensTimings solveDensH(// Host input/output
     auto& d_activeTmp       = s.activeTmp;         // scratch for copy_if
     auto& d_activeLeaves    = s.activeLeaves;
     auto& d_activeLeavesTmp = s.activeLeavesTmp;   // scratch (ngas upper bound)
-    d_activeParticles.resize(ngas);
-    d_activeTmp.resize(ngas);
     d_activeLeaves.resize(nLeaves);
-    d_activeLeavesTmp.resize(ngas);
     // Solve for live particles only: dead ones sit past nAlive in the Hilbert order,
     // belong to no leaf, and keep the negative h phantom gave them.
     thrust::sequence(d_activeParticles.begin(), d_activeParticles.begin() + s.nAlive);
@@ -965,9 +961,6 @@ DensTimings solveDensH(// Host input/output
     auto& d_xi = s.xi;
     if (grads)
     {
-        d_divv.resize(ngas);
-        d_ddivvdt.resize(ngas);
-        d_xi.resize(ngas);
 
         cudaEvent_t evG0, evGJ, evG1;
         checkGpuErrors(hipEventCreate(&evG0));
@@ -1017,7 +1010,6 @@ DensTimings solveDensH(// Host input/output
     HIP_CHECK(hipEventRecord(evDl0));
     {
         auto& d_out = s.dStage;
-        d_out.resize(ngas);
         thrust::scatter(s.h.begin(),     s.h.end(),     s.order.begin(), d_out.begin());
         HIP_CHECK(hipMemcpy(h_host,     rawPtr(d_out), ngas*sizeof(double), hipMemcpyDeviceToHost));
         thrust::scatter(s.rho.begin(),   s.rho.end(),   s.order.begin(), d_out.begin());

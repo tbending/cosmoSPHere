@@ -33,6 +33,7 @@
  */
 
 #include "density.hpp"
+#include "gpu_state.hpp"
 #include "gpu_check.hpp"
 #include "kernel.hpp"
 #include "util/cuda_utils.hpp"
@@ -68,6 +69,18 @@ extern "C" void densityiterate_gpu_c(
 {
     // Set COSMO_DENS_STATS=1 for a one-line phase breakdown per solve on stderr.
     // Costs two clock reads when off.
+    // The host sizes the device arrays through cosmo_arrays_init.  Refuse rather than
+    // resize behind it: a mismatch here means the two sides disagree about the particle
+    // count, which would otherwise show up as silent out-of-bounds device writes.
+    if (gpuState().sizedFor != n)
+    {
+        std::fprintf(stderr,
+            "FATAL: %s called with n=%d but the device arrays are sized for %d "
+            "(cosmo_arrays_init not called, or called with a different count)\n",
+            "densityiterate_gpu_c", n, gpuState().sizedFor);
+        std::abort();
+    }
+
     static const bool stats = (std::getenv("COSMO_DENS_STATS") != nullptr);
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();

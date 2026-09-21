@@ -111,7 +111,7 @@ endif
 	@echo "Using the Cornerstone octree from octree-miniapp (header-only: compiled as part of cosmoSPHere)"
 	@echo ""
 
-$(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/tree.o $(BUILDDIR)/force.o $(BUILDDIR)/gpu_state.o $(BUILDDIR)/dens_c_api.o $(BUILDDIR)/force_c_api.o $(BUILDDIR)/pin_c_api.o
+$(BUILDDIR)/libcosmoSPHere.a: $(BUILDDIR)/density_base.o $(BUILDDIR)/tree.o $(BUILDDIR)/force.o $(BUILDDIR)/gpu_state.o $(BUILDDIR)/arrays_c_api.o $(BUILDDIR)/dens_c_api.o $(BUILDDIR)/force_c_api.o $(BUILDDIR)/pin_c_api.o
 	ar rcs $@ $^
 
 $(BUILDDIR)/pin_c_api.o: src/pin_c_api.cu $(TAGFILE)
@@ -119,6 +119,9 @@ $(BUILDDIR)/pin_c_api.o: src/pin_c_api.cu $(TAGFILE)
 
 $(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/dens_c_api.d -c -o $@ $<
+
+$(BUILDDIR)/arrays_c_api.o: src/arrays_c_api.cu $(TAGFILE)
+	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/arrays_c_api.d -c -o $@ $<
 
 # Scalar (base) binary
 $(BUILDDIR)/density_hip: $(BUILDDIR)/main.base.o $(BUILDDIR)/density_base.o \

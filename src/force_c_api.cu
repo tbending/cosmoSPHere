@@ -47,6 +47,18 @@ extern "C" void force_gpu_c(
 {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
+    // The host sizes the device arrays through cosmo_arrays_init.  Refuse rather than
+    // resize behind it: a mismatch here means the two sides disagree about the particle
+    // count, which would otherwise show up as silent out-of-bounds device writes.
+    if (gpuState().sizedFor != n)
+    {
+        std::fprintf(stderr,
+            "FATAL: %s called with n=%d but the device arrays are sized for %d "
+            "(cosmo_arrays_init not called, or called with a different count)\n",
+            "force_gpu_c", n, gpuState().sizedFor);
+        std::abort();
+    }
+
     GpuState& s = gpuState();
 
     // Refuse rather than run on an absent or mismatched tree.  Repeated calls on the

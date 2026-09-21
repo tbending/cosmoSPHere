@@ -89,6 +89,11 @@ struct GpuState
     thrust::device_vector<double> fx, fy, fz, f4, vsigmax, divvF;   // outputs, Hilbert order
     thrust::device_vector<double> fStage;        // one array in phantom order, either direction
 
+    // Particle count the arrays above were sized for by sizeParticleArrays, 0 if never.
+    // The entry points refuse to run on anything else rather than resize behind the
+    // caller's back: the host decides the footprint, once, through cosmo_arrays_init.
+    int sizedFor = 0;
+
     int ngas     = 0;
     double hfact = 0.0;   // h-rho relation of the last density solve, for the force pass
     // Live particles (h > 0) form the prefix [0, nAlive) of the Hilbert order; dead
@@ -118,3 +123,16 @@ struct GpuState
 
 //! @brief The one state shared by the density and force entry points (gpu_state.cu).
 GpuState& gpuState();
+
+/*! @brief Size every array whose length is the particle count, in one place.
+ *
+ * Called once per particle count through cosmo_arrays_init, so the device footprint is
+ * decided by the host rather than by whichever kernel happened to touch an array first.
+ *
+ * It does NOT cover the tree-shaped arrays -- octree, centers, sizes, leafToInternal,
+ * layout, hmax_leaf, hmax_node, jlist, jcount, jOffset, allLeaves, activeLeaves, and the
+ * csTree/counts/tmpTree/workArray the rebalance iterates on.  Their lengths follow
+ * nLeaves and numNodes, which are not known until the tree has been built, so they are
+ * still sized where they are filled.
+ */
+void sizeParticleArrays(GpuState& s, int n);
