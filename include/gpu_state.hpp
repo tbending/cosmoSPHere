@@ -46,6 +46,15 @@ struct GpuState
     thrust::device_vector<int> order;            // sorted index -> phantom index
 
     // ---- the octree ----
+    // csTree/counts are the cornerstone leaf tree and its per-leaf particle counts, the
+    // in/out pair updateOctreeGpu iterates on; tmpTree and workArray are its scratch.
+    // These were function locals in buildTree, so all four were allocated and freed on
+    // every density solve -- exactly the thrust churn this struct exists to remove.
+    // Only the STORAGE persists: buildTree re-seeds csTree and counts every call, so the
+    // tree is still rebuilt from scratch (see the note at the top of this file).
+    thrust::device_vector<uint64_t>              csTree, tmpTree;
+    thrust::device_vector<unsigned>              counts;
+    thrust::device_vector<cstone::TreeNodeIndex> workArray;
     cstone::OctreeData<uint64_t, cstone::GpuTag> octree;
     cstone::Box<double> box{0., 1., cstone::BoundaryType::open};
     thrust::device_vector<cstone::Vec3<double>> centers, sizes;   // per node, geometric

@@ -114,10 +114,22 @@ void buildTree(GpuState& s,
     // -----------------------------------------------------------------------
     // Cornerstone leaf tree + fully linked internal tree
     // -----------------------------------------------------------------------
-    thrust::device_vector<uint64_t>      csTree = std::vector<uint64_t>{0, nodeRange<uint64_t>(0)};
-    thrust::device_vector<unsigned>      counts = std::vector<unsigned>{(unsigned)s.nAlive};
-    thrust::device_vector<uint64_t>      tmpTree;
-    thrust::device_vector<TreeNodeIndex> workArray;
+    // Storage lives in GpuState and is reused; the CONTENTS are re-seeded here every
+    // call, so this is the same single-root starting point as before and the tree is
+    // still rebuilt from scratch.  assign() keeps the capacity earlier calls grew these
+    // to, which is the whole point of hoisting them.  tmpTree and workArray are scratch:
+    // rebalanceTreeGpu resizes and fully writes tmpTree before reading it, and the
+    // exclusive_scan over workArray never reads its own uninitialised last element, so
+    // neither cares what a previous call left behind.
+    auto& csTree    = s.csTree;
+    auto& counts    = s.counts;
+    auto& tmpTree   = s.tmpTree;
+    auto& workArray = s.workArray;
+
+    const uint64_t seedTree[2]  = {0, nodeRange<uint64_t>(0)};
+    const unsigned seedCounts[1] = {(unsigned)s.nAlive};
+    csTree.assign(seedTree,   seedTree + 2);
+    counts.assign(seedCounts, seedCounts + 1);
 
     // d_keys is already sorted — run update until the leaf partition is stable.
     while (!updateOctreeGpu(rawPtr(d_keys), rawPtr(d_keys) + s.nAlive,
