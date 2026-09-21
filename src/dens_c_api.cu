@@ -45,16 +45,6 @@
 #include <vector>
 
 extern "C" void densityiterate_gpu_c(
-    const double* h,         // in: starting guess for the smoothing lengths
-    const double* x,
-    const double* y,
-    const double* z,
-    const double* vx,
-    const double* vy,
-    const double* vz,
-    const double* ax,
-    const double* ay,
-    const double* az,
     int           n,
     double        pmass,
     int           periodic,  // nonzero: periodic in x, y and z
@@ -80,11 +70,8 @@ extern "C" void densityiterate_gpu_c(
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
 
-    GradFields grads{vx, vy, vz, ax, ay, az};
-
     auto t1 = clk::now();
-    DensTimings t = solveDensH(h, x, y, z, n, pmass,
-                               KernelMode::FLAT_PARTICLE, &grads,
+    DensTimings t = solveDensH(n, pmass, KernelMode::FLAT_PARTICLE, /*withGradients=*/true,
                                periodic ? box : nullptr, tolh, hfact);
     auto t2 = clk::now();
 
@@ -115,11 +102,12 @@ extern "C" void densityiterate_gpu_c(
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
         const double solve = ms(t1, t2);
-        // download= is NOT in this sum.  The transfers are host-driven now, so they fall
-        // outside the solve, and the figure covers the whole step -- both the density
-        // bundles and the force pass's -- rather than this solve alone.  Adding it to a
-        // sum of this solve's device phases would be comparing two different windows.
-        const double gpu   = 1e3 * (t.upload + t.bboxAndSetup + t.keysAndSort + t.treeBuild
+        // Neither upload= nor download= is in this sum.  Both transfers are host-driven
+        // now, so they fall outside the solve and their figures cover the whole step --
+        // the density bundles and the force pass's alike -- rather than this solve alone.
+        // Adding either to a sum of this solve's device phases would be comparing two
+        // different windows.  gpusum is therefore the device work, transfers excluded.
+        const double gpu   = 1e3 * (t.bboxAndSetup + t.keysAndSort + t.treeBuild
                                   + t.nodeCenters + t.jleafBuild + t.densKernel
                                   + t.gradJleafBuild + t.gradKernel);
         std::fprintf(stderr,

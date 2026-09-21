@@ -62,21 +62,17 @@ struct DensTimings
 // Raw pointers rather than std::vector: these come straight from Fortran arrays
 // through the C API, and the inputs are read-only, so there is nothing to gain
 // from copying them into vectors first.  All arrays are length n.
-struct GradFields
-{
-    // inputs
-    const double* vx; const double* vy; const double* vz;   // velocity
-    const double* ax; const double* ay; const double* az;   // acceleration (fxyzu+fext)
-    // Outputs are not here: the host fetches them with cosmo_download(COSMO_GRAD_OUT).
-    // Whether they are COMPUTED is still decided by whether grads is given at all.
-};
+// Inputs and outputs both moved out: the host puts the velocity and acceleration on
+// the device with cosmo_upload and takes the results with cosmo_download.  All that is
+// left of this is the switch for whether the sweep runs at all, which solveDensH takes
+// as withGradients.
 
 // Solve for smoothing lengths h and densities rho for all particles.
-// h_host is an input, the starting guess; the converged h, rho and gradh are left on
-// the device for the host to fetch with cosmo_download.
-// x/y/z (n each) and pmass are read-only inputs.
+// Positions, h, velocity and acceleration must already be on the device (cosmo_upload);
+// the converged h, rho, gradh and the gradient fields are left there for the host to
+// fetch with cosmo_download.  Nothing is copied either way here.
 // mode selects the GPU density kernel (default: FLAT_PARTICLE).
-// grads is optional — see GradFields above.
+// withGradients runs the extra sweep described above.
 // periodicBox is nullptr for open boundaries, or {xmin, xmax, ymin, ymax, zmin, zmax}
 // of a domain periodic in all three directions, with every live particle inside it.
 // The choice holds for the force pass on the same tree too.
@@ -86,14 +82,10 @@ struct GradFields
 //
 // Leaves the tree, the Hilbert-sorted particle data and the leaf bookkeeping in the
 // shared state, so a repeated solve reuses the allocations — see gpu_state.hpp.
-DensTimings solveDensH(const double* h_host,
-                       const double* x_host,
-                       const double* y_host,
-                       const double* z_host,
-                       int n,
+DensTimings solveDensH(int n,
                        double pmass,
                        KernelMode mode = KernelMode::FLAT_PARTICLE,
-                       const GradFields* grads = nullptr,
+                       bool withGradients = false,
                        const double* periodicBox = nullptr,
                        double tolh = 1.0e-4,
                        double hfact = -1.0);   // < 0: the kernel's default

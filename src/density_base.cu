@@ -717,16 +717,10 @@ __global__ void sphGradientsKernel(
 // ---------------------------------------------------------------------------
 // Host driver: build the tree, solve for h, then sweep the gradients.
 // ---------------------------------------------------------------------------
-DensTimings solveDensH(// Host input
-                        const double* h_host,
-                        // Host input (read-only)
-                        const double* x_host,
-                        const double* y_host,
-                        const double* z_host,
-                        int n,
+DensTimings solveDensH(int n,
                         double pmass,
                         KernelMode mode,
-                        const GradFields* grads,
+                        bool withGradients,
                         const double* periodicBox,
                         double tolh,
                         double hfact)
@@ -748,37 +742,25 @@ DensTimings solveDensH(// Host input
     // local.  Everything is resized then fully overwritten, so reuse across calls
     // cannot leak values from the previous step.
     // -----------------------------------------------------------------------
+    // Positions, h, velocity and acceleration are already on the device: the host put
+    // them there with cosmo_upload, in phantom order, and the tree build below sorts
+    // them.  All that is left is what the solve needs to know, and clearing its outputs.
     HIP_CHECK(hipEventRecord(evUpload0));
     if (!(hfact > 0.0)) hfact = sph::hfact_default;
     s.ngas  = ngas;
     s.hfact = hfact;   // the force pass on this tree uses the same h-rho relation
-    s.x.assign(x_host, x_host + ngas);
-    s.y.assign(y_host, y_host + ngas);
-    s.z.assign(z_host, z_host + ngas);
-    s.h.assign(h_host, h_host + ngas);
-    s.rho.assign(ngas, 0.0);
-    s.gradh.assign(ngas, 0.0);
-    // Scratch lives in `s` and is resized, not reallocated, on each solve.
+    thrust::fill(s.rho.begin(),   s.rho.end(),   0.0);
+    thrust::fill(s.gradh.begin(), s.gradh.end(), 0.0);
     auto& d_converged = s.converged;
     thrust::fill(d_converged.begin(), d_converged.end(), 0);
 
-    // Velocity and acceleration are only needed for the gradient sweep.  Velocity
-    // persists because force needs it; acceleration does not.
+    // Velocity and acceleration are sorted only when the gradient sweep runs; velocity
+    // stays sorted afterwards because the force pass uses it.
     auto& d_ax = s.ax;
     auto& d_ay = s.ay;
     auto& d_az = s.az;
-    s.vx.clear(); s.vy.clear(); s.vz.clear();
     std::vector<thrust::device_vector<double>*> alsoSort;
-    if (grads)
-    {
-        s.vx.assign(grads->vx, grads->vx + ngas);
-        s.vy.assign(grads->vy, grads->vy + ngas);
-        s.vz.assign(grads->vz, grads->vz + ngas);
-        d_ax.assign(grads->ax, grads->ax + ngas);
-        d_ay.assign(grads->ay, grads->ay + ngas);
-        d_az.assign(grads->az, grads->az + ngas);
-        alsoSort = {&s.vx, &s.vy, &s.vz, &d_ax, &d_ay, &d_az};
-    }
+    if (withGradients) alsoSort = {&s.vx, &s.vy, &s.vz, &d_ax, &d_ay, &d_az};
     HIP_CHECK(hipEventRecord(evUpload1));
 
     // -----------------------------------------------------------------------
@@ -957,7 +939,7 @@ DensTimings solveDensH(// Host input
     auto& d_divv = s.divv;
     auto& d_ddivvdt = s.ddivvdt;
     auto& d_xi = s.xi;
-    if (grads)
+    if (withGradients)
     {
 
         cudaEvent_t evG0, evGJ, evG1;
@@ -1012,7 +994,9 @@ DensTimings solveDensH(// Host input
     checkGpuErrors(hipEventSynchronize(evDl1));
 
     float ms = 0;
-    HIP_CHECK(hipEventElapsedTime(&ms, evUpload0, evUpload1)); t.upload     = ms * 1e-3;
+    // upload= is the host's cosmo_upload calls, which sit outside this solve, so it
+    // is the accumulator rather than an event pair.  Same window as download=.
+    t.upload = s.uploadSeconds;   s.uploadSeconds = 0.0;
     HIP_CHECK(hipEventElapsedTime(&ms, ev3,       ev4));       t.densKernel = ms * 1e-3 - t.jleafBuild;
     // download= is the host-driven cosmo_download calls for the solve just finished;
     // the ones for THIS solve have not happened yet, so report what the last one cost.

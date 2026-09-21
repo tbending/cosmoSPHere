@@ -26,13 +26,6 @@
 extern "C" void force_gpu_c(
     int n,
     double pmass,
-    const double* vx,
-    const double* vy,
-    const double* vz,
-    const double* pro2,
-    const double* spsound,
-    const double* alphaAV,
-    const double* u,
     double beta,
     double alphau,
     int disc_viscosity,   // nonzero: phantom's disc_viscosity form of the artificial viscosity
@@ -66,9 +59,8 @@ extern "C" void force_gpu_c(
         std::abort();
     }
 
-    ForceFields f{vx, vy, vz, pro2, spsound, alphaAV, u};
     ForceTimings ft;
-    computeForces(s, f, pmass, beta, alphau, disc_viscosity != 0,
+    computeForces(s, pmass, beta, alphau, disc_viscosity != 0,
                   pdv_heating > 0, shock_heating > 0, ft);
 
     // Same env gate as the density solve, so one setting shows the whole picture.
