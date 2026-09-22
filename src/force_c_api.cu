@@ -26,27 +26,26 @@
 extern "C" void force_gpu_c(
     int n,
     double pmass,
-    const double* vx,
-    const double* vy,
-    const double* vz,
-    const double* pro2,
-    const double* spsound,
-    const double* alphaAV,
-    const double* u,
     double beta,
     double alphau,
     int disc_viscosity,   // nonzero: phantom's disc_viscosity form of the artificial viscosity
     int pdv_heating,      // phantom's ipdv_heating: 0 leaves p dV work out of du/dt
-    int shock_heating,    // phantom's ishock_heating: 0 leaves shock heating out of du/dt
-    double* fx,
-    double* fy,
-    double* fz,
-    double* f4,
-    double* vsigmax,
-    double* divv)
+    int shock_heating)    // phantom's ishock_heating: 0 leaves shock heating out of du/dt
 {
     using clk = std::chrono::steady_clock;
     const auto t0 = clk::now();
+    // The host sizes the device arrays through cosmo_arrays_init.  Refuse rather than
+    // resize behind it: a mismatch here means the two sides disagree about the particle
+    // count, which would otherwise show up as silent out-of-bounds device writes.
+    if (gpuState().sizedFor != n)
+    {
+        std::fprintf(stderr,
+            "FATAL: %s called with n=%d but the device arrays are sized for %d "
+            "(cosmo_arrays_init not called, or called with a different count)\n",
+            "force_gpu_c", n, gpuState().sizedFor);
+        std::abort();
+    }
+
     GpuState& s = gpuState();
 
     // Refuse rather than run on an absent or mismatched tree.  Repeated calls on the
@@ -60,10 +59,8 @@ extern "C" void force_gpu_c(
         std::abort();
     }
 
-    ForceFields f{vx, vy, vz, pro2, spsound, alphaAV, u,
-                  fx, fy, fz, f4, vsigmax, divv};
     ForceTimings ft;
-    computeForces(s, f, pmass, beta, alphau, disc_viscosity != 0,
+    computeForces(s, pmass, beta, alphau, disc_viscosity != 0,
                   pdv_heating > 0, shock_heating > 0, ft);
 
     // Same env gate as the density solve, so one setting shows the whole picture.

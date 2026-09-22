@@ -33,6 +33,7 @@
  */
 
 #include "density.hpp"
+#include "gpu_state.hpp"
 #include "gpu_check.hpp"
 #include "kernel.hpp"
 #include "util/cuda_utils.hpp"
@@ -44,21 +45,6 @@
 #include <vector>
 
 extern "C" void densityiterate_gpu_c(
-    double*       h,         // in/out: smoothing lengths
-    double*       rho,       // out:    density
-    double*       gradh_out, // out:    d(rho)/d(h) normalised
-    double*       divv,      // out:    div v
-    double*       xi,        // out:    xi limiter
-    double*       ddivvdt,   // out:    d(div v)/dt
-    const double* x,
-    const double* y,
-    const double* z,
-    const double* vx,
-    const double* vy,
-    const double* vz,
-    const double* ax,
-    const double* ay,
-    const double* az,
     int           n,
     double        pmass,
     int           periodic,  // nonzero: periodic in x, y and z
@@ -68,15 +54,24 @@ extern "C" void densityiterate_gpu_c(
 {
     // Set COSMO_DENS_STATS=1 for a one-line phase breakdown per solve on stderr.
     // Costs two clock reads when off.
+    // The host sizes the device arrays through cosmo_arrays_init.  Refuse rather than
+    // resize behind it: a mismatch here means the two sides disagree about the particle
+    // count, which would otherwise show up as silent out-of-bounds device writes.
+    if (gpuState().sizedFor != n)
+    {
+        std::fprintf(stderr,
+            "FATAL: %s called with n=%d but the device arrays are sized for %d "
+            "(cosmo_arrays_init not called, or called with a different count)\n",
+            "densityiterate_gpu_c", n, gpuState().sizedFor);
+        std::abort();
+    }
+
     static const bool stats = (std::getenv("COSMO_DENS_STATS") != nullptr);
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
 
-    GradFields grads{vx, vy, vz, ax, ay, az, divv, xi, ddivvdt};
-
     auto t1 = clk::now();
-    DensTimings t = solveDensH(h, rho, gradh_out, x, y, z, n, pmass,
-                               KernelMode::FLAT_PARTICLE, &grads,
+    DensTimings t = solveDensH(n, pmass, KernelMode::FLAT_PARTICLE, /*withGradients=*/true,
                                periodic ? box : nullptr, tolh, hfact);
     auto t2 = clk::now();
 
@@ -107,9 +102,14 @@ extern "C" void densityiterate_gpu_c(
             return std::chrono::duration<double, std::milli>(b - a).count();
         };
         const double solve = ms(t1, t2);
-        const double gpu   = 1e3 * (t.upload + t.bboxAndSetup + t.keysAndSort + t.treeBuild
+        // Neither upload= nor download= is in this sum.  Both transfers are host-driven
+        // now, so they fall outside the solve and their figures cover the whole step --
+        // the density bundles and the force pass's alike -- rather than this solve alone.
+        // Adding either to a sum of this solve's device phases would be comparing two
+        // different windows.  gpusum is therefore the device work, transfers excluded.
+        const double gpu   = 1e3 * (t.bboxAndSetup + t.keysAndSort + t.treeBuild
                                   + t.nodeCenters + t.jleafBuild + t.densKernel
-                                  + t.gradJleafBuild + t.gradKernel + t.download);
+                                  + t.gradJleafBuild + t.gradKernel);
         std::fprintf(stderr,
             "COSMO_STATS n=%d leaves=%d iters=%d | vecin=%.2f upload=%.2f bbox=%.2f "
             "keysort=%.2f tree=%.2f nodes=%.2f jbuild=%.2f nrkern=%.2f gjbuild=%.2f "

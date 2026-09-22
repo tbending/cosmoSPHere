@@ -14,8 +14,6 @@
 #include <vector>
 
 #include <thrust/device_vector.h>
-#include <thrust/gather.h>
-#include <thrust/scatter.h>
 #include <thrust/sequence.h>
 
 void buildForceJLeafList(GpuState& s, ForceTimings& ft)
@@ -384,7 +382,7 @@ __global__ void sphForceKernelJList(
     divv[i] = -divv_s * divfac[i];
 }
 
-void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
+void computeForces(GpuState& s, double pmass, double beta,
                    double alphau, bool discViscosity, bool pdvHeating,
                    bool shockHeating, ForceTimings& ft)
 {
@@ -398,42 +396,14 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     for (auto* e : {&e0, &e1, &ep, &e2, &e3}) checkGpuErrors(hipEventCreate(e));
     HIP_CHECK(hipEventRecord(e0));
 
-    // Every device buffer lives in GpuState and is resized to n, a no-op after the first
-    // call, so a force pass allocates nothing on the device.
-    const size_t nbytes = static_cast<size_t>(n) * sizeof(double);
-    s.fStage.resize(n);
-
-    // phantom order -> Hilbert order (s.order maps sorted index -> phantom index)
-    auto upload = [&](const double* host, thrust::device_vector<double>& sorted)
-    {
-        HIP_CHECK(hipMemcpy(rawPtr(s.fStage), host, nbytes, hipMemcpyHostToDevice));
-        sorted.resize(n);
-        thrust::gather(s.order.begin(), s.order.end(), s.fStage.begin(), sorted.begin());
-    };
-    // Positions and h: the solve's Hilbert-sorted copies are exactly what phantom holds
-    // -- the positions it uploaded and the converged h it stored back -- and phantom
-    // only calls force again on the same tree when positions have not moved.
-    // Velocities: the solve's copies serve the first force pass after it; a later one is
-    // the corrector, with new velocities (see GpuState::forceToken).
-    const bool refreshV = (s.forceToken == s.token) || (int)s.vx.size() != n;
-    if (refreshV)
-    {
-        upload(f.vx, s.vx);
-        upload(f.vy, s.vy);
-        upload(f.vz, s.vz);
-    }
-    s.forceToken = s.token;
-
-    upload(f.pro2,    s.pro2);
-    upload(f.spsound, s.spsound);
-    upload(f.alphaAV, s.alphaAV);
-    upload(f.u,       s.u);
+    // Every input is already on the device, in Hilbert order: positions and h from the
+    // solve, and whatever the host chose to send with cosmo_upload_sorted.  The host
+    // decides whether the velocities need refreshing -- it knows whether this is the
+    // pass straight after a solve or the corrector -- so there is no rule here.
 
     // Not zeroed: the kernel writes all n entries of every output, dead particles included.
-    for (auto* v : {&s.fx, &s.fy, &s.fz, &s.f4, &s.vsigmax, &s.divvF}) v->resize(n);
     HIP_CHECK(hipEventRecord(e1));
 
-    for (auto* v : {&s.hsqinv, &s.hinv, &s.rhoh, &s.rho1, &s.grkfac, &s.pres, &s.auterm, &s.divfac}) v->resize(n);
     forcePrepKernel<<<iceil(n, 256), 256>>>(
         rawPtr(s.h), rawPtr(s.gradh), rawPtr(s.pro2),
         rawPtr(s.hsqinv), rawPtr(s.hinv), rawPtr(s.rhoh), rawPtr(s.rho1), rawPtr(s.grkfac),
@@ -471,18 +441,8 @@ void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
     HIP_CHECK(hipEventRecord(e2));
     HIP_CHECK(hipDeviceSynchronize());
 
-    // Hilbert order -> phantom order, then to the host
-    auto download = [&](const thrust::device_vector<double>& sorted, double* host)
-    {
-        thrust::scatter(sorted.begin(), sorted.end(), s.order.begin(), s.fStage.begin());
-        HIP_CHECK(hipMemcpy(host, rawPtr(s.fStage), nbytes, hipMemcpyDeviceToHost));
-    };
-    download(s.fx, f.fx);
-    download(s.fy, f.fy);
-    download(s.fz, f.fz);
-    download(s.f4, f.f4);
-    download(s.vsigmax, f.vsigmax);
-    download(s.divvF, f.divv);
+    // Results stay on the device: the host fetches them with
+    // cosmo_download(COSMO_FORCE_OUT).
 
     HIP_CHECK(hipEventRecord(e3));
     checkGpuErrors(hipEventSynchronize(e3));

@@ -28,19 +28,9 @@ struct ForceTimings
 // Host arrays for one force pass, in phantom order, all length n.  Raw pointers rather
 // than std::vector, as for GradFields: they come straight from Fortran through the C API.
 // Positions and h are not here: the force pass uses the solve's copies in GpuState.
-struct ForceFields
-{
-    // inputs
-    const double* vx; const double* vy; const double* vz;   // read on the corrector only
-    const double* pro2;      // P / rho^2
-    const double* spsound;   // sound speed
-    const double* alphaAV;   // artificial viscosity alpha
-    const double* u;         // specific thermal energy
-    // outputs
-    double* fx; double* fy; double* fz; double* f4;   // fxyzu(1:4)
-    double* vsigmax;         // max signal speed over neighbours, for the Courant timestep
-    double* divv;            // div v
-};
+// Inputs and outputs both moved out: the host puts velocity and the thermodynamic
+// quantities on the device with cosmo_upload_sorted and takes the results with
+// cosmo_download, so computeForces needs no field struct at all.
 
 /*! @brief Rebuild the j-leaf lists with the SYMMETRIC (gather + scatter) criterion.
  *
@@ -75,6 +65,6 @@ void buildForceJLeafList(GpuState& s, ForceTimings& ft);
  */
 // pdvHeating and shockHeating are phantom's ipdv_heating and ishock_heating: which
 // terms go into du/dt.
-void computeForces(GpuState& s, const ForceFields& f, double pmass, double beta,
+void computeForces(GpuState& s, double pmass, double beta,
                    double alphau, bool discViscosity, bool pdvHeating,
                    bool shockHeating, ForceTimings& ft);

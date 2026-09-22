@@ -1,4 +1,18 @@
 /*
+ * NOT BUILT.  Kept as a record of an idea that was not carried through.
+ *
+ * This was half of the standalone density benchmark (density_hip / density_hip_unrolled),
+ * from before phantom became the consumer.  It calls solveDensH with the signature it had
+ * when that call copied its results back to the host; the host fetches them with
+ * cosmo_download now, so this no longer compiles.  The Makefile has no rule for it, which
+ * is deliberate.
+ *
+ * To revive it: take h, rho and gradh with cosmo_download(COSMO_HSML, ...) and
+ * cosmo_download(COSMO_DENS_OUT, ...) after the solve, remembering that a slot arrives as
+ * ncomp contiguous runs of n.
+ */
+
+/*
  * density.cuh — GPU density + smoothing-length solver using a Cornerstone octree.
  *
  * Pipeline:

@@ -17,11 +17,10 @@
  * PARTICLE ORDERING
  * -----------------
  * Everything here is in HILBERT-SORTED order, which is not phantom's order.
- * `order` maps sorted index -> original phantom index.  Each C API entry point
- * gathers inputs in and scatters outputs back, so phantom never sees the sorted
- * ordering.  Removing that round trip means keeping particles resident across steps
- * — deliberately not attempted yet.  It is worth ~0.5 ms; pinning the host buffers
- * is worth ~3.7 ms and is the better next target.
+ * `order` maps sorted index -> original phantom index.  The transfer routines in
+ * arrays_c_api.cu gather on the way in and scatter on the way out, so phantom never
+ * sees the sorted ordering.  Removing that round trip means keeping particles
+ * resident across steps — deliberately not attempted yet.  It is worth ~0.5 ms.
  *
  * Single device, single state.  No multi-GPU, no concurrent solves.
  */
@@ -46,6 +45,15 @@ struct GpuState
     thrust::device_vector<int> order;            // sorted index -> phantom index
 
     // ---- the octree ----
+    // csTree/counts are the cornerstone leaf tree and its per-leaf particle counts, the
+    // in/out pair updateOctreeGpu iterates on; tmpTree and workArray are its scratch.
+    // These were function locals in buildTree, so all four were allocated and freed on
+    // every density solve -- exactly the thrust churn this struct exists to remove.
+    // Only the STORAGE persists: buildTree re-seeds csTree and counts every call, so the
+    // tree is still rebuilt from scratch (see the note at the top of this file).
+    thrust::device_vector<uint64_t>              csTree, tmpTree;
+    thrust::device_vector<unsigned>              counts;
+    thrust::device_vector<cstone::TreeNodeIndex> workArray;
     cstone::OctreeData<uint64_t, cstone::GpuTag> octree;
     cstone::Box<double> box{0., 1., cstone::BoundaryType::open};
     thrust::device_vector<cstone::Vec3<double>> centers, sizes;   // per node, geometric
@@ -71,14 +79,27 @@ struct GpuState
     thrust::device_vector<double> ax, ay, az;    // acceleration, gradient sweep only
     thrust::device_vector<int> converged, activeParticles, activeTmp, activeLeaves, activeLeavesTmp;
     thrust::device_vector<double> divv, ddivvdt, xi;     // gradient sweep outputs, Hilbert order
-    thrust::device_vector<double> dStage;                // phantom-order staging for downloads
+    // One array in phantom order that every host transfer passes through, in either
+    // direction.  Density and force used to stage separately because their transfers
+    // lived in different files; they are one routine now, and never overlap.
+    thrust::device_vector<double> xferStage;
 
     // ---- force pass buffers, sized to ngas and reused across calls ----
     thrust::device_vector<double> pro2, spsound, alphaAV, u;         // inputs, Hilbert order
     // per-particle factors of the force sum, formed once per pass (forcePrepKernel)
     thrust::device_vector<double> hsqinv, hinv, rhoh, rho1, grkfac, pres, auterm, divfac;
     thrust::device_vector<double> fx, fy, fz, f4, vsigmax, divvF;   // outputs, Hilbert order
-    thrust::device_vector<double> fStage;        // one array in phantom order, either direction
+
+    // Particle count the arrays above were sized for by sizeParticleArrays, 0 if never.
+    // The entry points refuse to run on anything else rather than resize behind the
+    // caller's back: the host decides the footprint, once, through cosmo_arrays_init.
+    int sizedFor = 0;
+
+    // Seconds spent in the host-driven transfers since the last density solve.  They
+    // moved out of the compute calls, so these are what COSMO_DENS_STATS reports as
+    // upload= and download=; solveDensH reads and clears them.
+    double uploadSeconds   = 0.0;
+    double downloadSeconds = 0.0;
 
     int ngas     = 0;
     double hfact = 0.0;   // h-rho relation of the last density solve, for the force pass
@@ -98,14 +119,21 @@ struct GpuState
     // bumps token, so a mismatch is exactly "needs rebuild" — nothing to invalidate.
     uint64_t jlistToken = 0;
 
-    // The token of the last force pass.  The first force pass after a solve can use
-    // the velocities the solve uploaded -- derivs passes the same array to both --
-    // but a later pass on the same tree is the leapfrog corrector, whose velocities
-    // have changed, so it uploads them again.
-    uint64_t forceToken = 0;
-
     bool readyForForce(int n) const { return ngas == n && token != 0; }
 };
 
 //! @brief The one state shared by the density and force entry points (gpu_state.cu).
 GpuState& gpuState();
+
+/*! @brief Size every array whose length is the particle count, in one place.
+ *
+ * Called once per particle count through cosmo_arrays_init, so the device footprint is
+ * decided by the host rather than by whichever kernel happened to touch an array first.
+ *
+ * It does NOT cover the tree-shaped arrays -- octree, centers, sizes, leafToInternal,
+ * layout, hmax_leaf, hmax_node, jlist, jcount, jOffset, allLeaves, activeLeaves, and the
+ * csTree/counts/tmpTree/workArray the rebalance iterates on.  Their lengths follow
+ * nLeaves and numNodes, which are not known until the tree has been built, so they are
+ * still sized where they are filled.
+ */
+void sizeParticleArrays(GpuState& s, int n);
