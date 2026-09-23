@@ -28,6 +28,8 @@ git clone https://github.com/tbending/cosmoSPHere
 git clone https://github.com/exafmm/cornerstone-octree octree-miniapp
 ```
 
+Nothing else is needed: the standalone driver generates its own particles.
+
 ## Building
 
 ```bash
@@ -39,12 +41,18 @@ make CORNERSTONE_DIR=../cornerstone GPU_BACKEND=hip    # AMD
 Phantom builds the library itself (`make GPU=yes GPU_TARGET=...`), passing the backend,
 architecture and kernel.
 
-This produces two binaries in `build/`:
+`make` produces `build/density_hip`, the standalone solver; `make lib` produces
+`build/libcosmoSPHere.a`, which is what Phantom links.
 
-| Binary | Description |
-|---|---|
-| `build/density_hip` | Scalar inner j-loop |
-| `build/density_hip_unrolled` | 4× manually unrolled inner j-loop |
+```bash
+./build/density_hip lattice 50        # 173,850 particles on a close-packed lattice
+./build/density_hip lattice 100       # 1,403,000
+./build/density_hip <datafile>        # xyzh from a file, see include/io.hpp
+```
+
+It reports the solve broken down by phase — upload, Hilbert sort, tree build, j-leaf
+lists, density kernel, download — and runs both the flat-particle and warp-per-leaf
+kernels so their results and timings can be compared. No Phantom, no input file.
 
 ### Makefile variables
 
@@ -55,7 +63,7 @@ This produces two binaries in `build/`:
 | `CUDA_ARCH` | `80` | CUDA compute capabilities, space-separated |
 | `HIP_ARCH` | `gfx942` | AMD GPU target architecture |
 | `GPUCC` | `nvcc` / `hipcc` | Compiler override |
-| `KERNEL` | `cubic` | `cubic` or `quintic` (the unrolled binary is cubic-only) |
+| `KERNEL` | `cubic` | `cubic` or `quintic` |
 
 ## Running
 
@@ -90,9 +98,10 @@ cosmoSPHere/
 │   ├── io.hpp            — input file reader
 │   └── kernel.hpp        — M4 cubic spline kernel (W, dW/dq)
 ├── src/
-│   ├── main.cu           — standalone test driver
-│   ├── density_base.cu   — GPU solver, scalar inner j-loop
-│   └── density_unrolled.cu — GPU solver, 4× unrolled inner j-loop
+│   ├── main.cu           — standalone driver (build/density_hip)
+│   ├── arrays_c_api.cu   — sizing and the host/device transfers
+│   ├── density_base.cu   — GPU solver
+│   └── density_unrolled.cu — NOT BUILT: a 4× unrolled variant, kept as a record
 └── build/                — created by make, gitignored
 ```
 

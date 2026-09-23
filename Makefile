@@ -1,15 +1,15 @@
 # cosmoSPHere Makefile
 #
 # Targets:
-#   lib                — the static library phantom links against (the only build)
+#   all (default)      — the standalone density solver, build/density_hip
+#   lib                — the static library phantom links against
 #   clean              — remove build products
 #
-# src/main.cu and src/density_unrolled.cu are NOT built.  They are the standalone
-# density_hip and density_hip_unrolled benchmarks -- a scalar and a 4x-unrolled inner
-# j-loop -- kept as a record of an idea that was not carried through.  They call
-# solveDensH with the signature it had before the host took over fetching results, so
-# they no longer compile; that is deliberate rather than an oversight.  Anyone reviving
-# them needs to fetch h, rho and gradh with cosmo_download.
+# src/density_unrolled.cu is NOT built.  It is a second copy of the solver with a
+# 4x-unrolled inner j-loop, an experiment that was not carried through; it still calls
+# solveDensH with the signature it had before the host took over the transfers, so it
+# no longer compiles.  That is deliberate.  Reviving it means giving it the current
+# signature and fetching results with cosmo_download, as src/main.cu does.
 #
 # Configurable variables (override on command line or environment):
 #   CORNERSTONE_DIR  — path to cornerstone-octree source tree
@@ -87,7 +87,7 @@ $(shell [ "$$(cat $(TAGFILE) 2>/dev/null)" = "$(BUILD_TAG)" ] || printf '%s' "$(
 # ---------------------------------------------------------------------------
 .PHONY: all lib clean info
 
-all: lib
+all: $(BUILDDIR)/density_hip
 
 # ---------------------------------------------------------------------------
 # Static library target — used when linking against Phantom (GPU=yes).
@@ -122,6 +122,14 @@ $(BUILDDIR)/dens_c_api.o: src/dens_c_api.cu $(TAGFILE)
 
 $(BUILDDIR)/arrays_c_api.o: src/arrays_c_api.cu $(TAGFILE)
 	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/arrays_c_api.d -c -o $@ $<
+
+# Standalone density solver: the same objects phantom links, plus a driver.
+$(BUILDDIR)/density_hip: $(BUILDDIR)/main.o $(BUILDDIR)/density_base.o $(BUILDDIR)/tree.o \
+                         $(BUILDDIR)/gpu_state.o $(BUILDDIR)/arrays_c_api.o
+	$(GPUCC) $(GPU_FLAGS) -o $@ $^
+
+$(BUILDDIR)/main.o: src/main.cu $(TAGFILE)
+	$(GPUCC) $(GPU_FLAGS) -MMD -MP -MF $(BUILDDIR)/main.d -c -o $@ $<
 
 # Compile rules: each .cu in src/ becomes a .o in build/
 $(BUILDDIR)/tree.o: src/tree.cu $(TAGFILE)
